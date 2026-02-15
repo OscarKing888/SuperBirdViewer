@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from html import escape
 
 try:
     from PyQt6.QtWidgets import (
@@ -38,7 +39,7 @@ try:
         QGridLayout,
     )
     from PyQt6.QtCore import Qt, QMimeData, QSize
-    from PyQt6.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction
+    from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
 except ImportError:
     from PyQt5.QtWidgets import (
         QApplication,
@@ -67,7 +68,7 @@ except ImportError:
         QGridLayout,
     )
     from PyQt5.QtCore import Qt, QMimeData, QSize
-    from PyQt5.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction
+    from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -115,25 +116,161 @@ _orient = getattr(Qt, "Orientation", None)
 _Horizontal = getattr(_orient, "Horizontal", None) if _orient else None
 if _Horizontal is None:
     _Horizontal = getattr(Qt, "Horizontal", 1)
+if hasattr(QMessageBox, "Icon"):
+    _MsgInfo = QMessageBox.Icon.Information
+else:
+    _MsgInfo = QMessageBox.Information
+if hasattr(QMessageBox, "StandardButton"):
+    _MsgOk = QMessageBox.StandardButton.Ok
+else:
+    _MsgOk = QMessageBox.Ok
 
 import piexif
-from PIL import Image
+from PIL import Image, ImageOps
 from PIL.ExifTags import TAGS as PIL_TAGS
+
+# 可选：用于 RAW 的 EXIF 回退读取
+try:
+    import exifread
+except ImportError:
+    exifread = None
+
+# 可选：用于从 RAW 提取嵌入缩略图
+try:
+    import rawpy
+except ImportError:
+    rawpy = None
+
+# 支持的图片扩展名（含各家相机 RAW）
+IMAGE_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif",
+    # Canon
+    ".cr2", ".cr3", ".crw",
+    # Nikon
+    ".nef", ".nrw",
+    # Sony
+    ".arw", ".srf", ".sr2",
+    # Panasonic
+    ".rw2", ".raw",
+    # Olympus
+    ".orf", ".ori",
+    # Fujifilm
+    ".raf",
+    # Adobe / Leica 等
+    ".dng",
+    # Pentax
+    ".pef", ".ptx",
+    # Sigma
+    ".x3f",
+    # Leica
+    ".rwl",
+    # 其他常见 RAW
+    ".3fr", ".dcr", ".kdc", ".mef", ".mrw", ".rwz",
+)
+# 去重并保持顺序
+IMAGE_EXTENSIONS = tuple(dict.fromkeys(e.lower() for e in IMAGE_EXTENSIONS))
+RAW_EXTENSIONS = frozenset(
+    e for e in IMAGE_EXTENSIONS
+    if e not in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif")
+)
 
 
 # 与主程序同目录下的配置文件
 CONFIG_FILENAME = "EXIF.cfg"
+APP_ICON_CANDIDATES = (
+    os.path.join("image", "superexif.png"),
+    os.path.join("image", "superexif.ico"),
+    os.path.join("image", "superexif.icns"),
+)
+ABOUT_INFO_DEFAULT = {
+    "app_name": "SuperEXIF",
+    "version": "1.0.0",
+    "tagline": "图片 EXIF 查看与编辑工具",
+    "description": "支持拖拽查看、过滤检索和直接编辑常见 EXIF 字段。",
+    "author": "SuperEXIF Team",
+    "website": "",
+    "license": "",
+    "copyright": "",
+}
 
 
-def _get_config_path() -> str:
-    """返回 EXIF.cfg 的完整路径，与当前运行的主程序同目录。"""
+def _get_app_dir() -> str:
+    """返回当前程序目录（脚本目录或打包后可执行文件目录）。"""
     if getattr(sys, "frozen", False):
         app_dir = os.path.dirname(os.path.abspath(sys.executable))
     else:
         app_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     if not app_dir:
         app_dir = os.getcwd()
+    return app_dir
+
+
+def _get_resource_path(relative_path: str) -> str | None:
+    """按运行环境查找资源文件路径。"""
+    candidates = [os.path.join(_get_app_dir(), relative_path)]
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, relative_path))
+        if sys.platform == "darwin":
+            # macOS .app 中资源通常位于 Contents/Resources
+            candidates.append(
+                os.path.abspath(os.path.join(_get_app_dir(), "..", "Resources", relative_path))
+            )
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _get_app_icon_path() -> str | None:
+    """返回应用图标路径。"""
+    for rel in APP_ICON_CANDIDATES:
+        p = _get_resource_path(rel)
+        if p:
+            return p
+    return None
+
+
+def _get_config_path() -> str:
+    """返回 EXIF.cfg 的完整路径，与当前运行的主程序同目录。"""
+    app_dir = _get_app_dir()
     return os.path.join(app_dir, CONFIG_FILENAME)
+
+
+def _load_settings() -> dict:
+    """读取 EXIF.cfg，失败返回空字典。"""
+    candidates = [_get_config_path()]
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, CONFIG_FILENAME))
+        if sys.platform == "darwin":
+            candidates.append(os.path.abspath(os.path.join(_get_app_dir(), "..", "Resources", CONFIG_FILENAME)))
+    seen = set()
+    for path in candidates:
+        norm = os.path.normpath(path)
+        if norm in seen or not os.path.isfile(path):
+            continue
+        seen.add(norm)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return {}
+
+
+def _save_settings(data: dict):
+    """写入 EXIF.cfg（UTF-8）。"""
+    path = _get_config_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 # IFD 分组显示名称
 IFD_DISPLAY_NAMES = {
@@ -191,28 +328,71 @@ def _sanitize_display_string(s: str) -> str:
     return "".join(result).strip()
 
 
-def _looks_binary(data: bytes) -> bool:
-    """若字节序列多为不可打印或高位字节，则视为二进制，不按文本解码。"""
-    if len(data) > 2048:
+def _decoded_looks_text(s: str) -> bool:
+    """
+    解码后的字符串是否像可读文本（用于决定显示为文本还是十六进制）。
+    若大量替换符或大量控制字符则视为二进制/乱码，应显示为 hex。
+    """
+    if not s or len(s) < 2:
         return True
-    printable = sum(1 for b in data if 32 <= b < 127 or b in (9, 10, 13))
-    return printable < len(data) * 0.6
+    n = len(s)
+    replacement = s.count("\ufffd")
+    if replacement > n * 0.15:  # 超过 15% 为替换符，可能解码错误
+        return False
+    # 可接受字符：可打印、空格、\t\n\r、以及常见 CJK 等
+    ok = 0
+    for c in s:
+        code = ord(c)
+        if code == 0 or (code < 32 and c not in "\t\n\r"):
+            continue  # 控制字符不计入 ok
+        if code < 127 or (code >= 0x4E00 and code <= 0x9FFF) or (code >= 0x3000 and code <= 0x303F):
+            ok += 1
+        else:
+            ok += 1  # 其他 Unicode（如拉丁扩展、符号）也视为可读
+    return ok >= n * 0.5  # 至少一半像可读字符
+
+
+def _tuple_as_bytes(value: tuple) -> bytes | None:
+    """若 tuple 全为 0–255 的整数则视为字节序列，返回 bytes；否则返回 None。"""
+    if not value:
+        return None
+    try:
+        if all(isinstance(x, int) and 0 <= x <= 255 for x in value):
+            return bytes(value)
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def format_exif_value(value):
-    """将 piexif 的原始值格式化为可读字符串，保证跨系统无乱码。"""
+    """
+    将 piexif 的原始值格式化为可读字符串。
+    凡可能是文本的（bytes、整数元组表示的字节）都先尝试按多种编码解码为可读文本，
+    仅当解码结果明显不可读（乱码/二进制）时才显示十六进制。
+    """
     if value is None:
         return ""
     if isinstance(value, bytes):
-        # 纯二进制或过长时只显示十六进制
-        if len(value) > 512 or _looks_binary(value):
-            return value.hex() if len(value) <= 64 else value.hex() + "..."
-        return _safe_decode_bytes(value)
+        s = _safe_decode_bytes(value)
+        if _decoded_looks_text(s):
+            if len(s) > 2048:
+                return s[:2048] + "\n... (已截断)"
+            return s
+        return value.hex() if len(value) <= 64 else value.hex() + "..."
     if isinstance(value, tuple):
         if len(value) == 2 and isinstance(value[0], int) and isinstance(value[1], int):
             if value[1] != 0:
                 return f"{value[0]}/{value[1]} ({value[0] / value[1]:.4f})"
             return f"{value[0]}/{value[1]}"
+        # XMLPacket / XMP / 其他 UNDEFINED 等可能被 piexif 解析为整数元组，按字节解码为可读文本
+        data = _tuple_as_bytes(value)
+        if data is not None:
+            s = _safe_decode_bytes(data)
+            if _decoded_looks_text(s):
+                if len(s) > 2048:
+                    return s[:2048] + "\n... (已截断)"
+                return s
+            return data.hex() if len(data) <= 64 else data.hex() + "..."
         return ", ".join(str(format_exif_value(v)) for v in value)
     if isinstance(value, (int, float)):
         return str(value)
@@ -240,6 +420,153 @@ def load_exif_piexif(path: str) -> dict | None:
         return None
 
 
+def get_raw_thumbnail(path: str) -> bytes | None:
+    """
+    从 RAW 文件中获取嵌入的 JPEG 缩略图字节，用于预览。
+    先尝试 piexif（TIFF 系 RAW 如 DNG/CR2/NEF），再尝试 rawpy。
+    返回 None 表示无法获取缩略图。
+    """
+    if Path(path).suffix.lower() not in RAW_EXTENSIONS:
+        return None
+    # 1) piexif：TIFF 系 RAW 的 thumbnail 为 JPEG 字节
+    try:
+        data = piexif.load(path)
+        thumb = data.get("thumbnail")
+        if isinstance(thumb, bytes) and len(thumb) > 100:
+            return thumb
+    except Exception:
+        pass
+    # 2) rawpy：多数 RAW 格式的嵌入预览/缩略图
+    if rawpy is None:
+        return None
+    try:
+        with rawpy.imread(path) as rp:
+            thumb = rp.extract_thumb()
+        if thumb is None:
+            return None
+        if hasattr(rawpy, "ThumbFormat") and thumb.format == rawpy.ThumbFormat.JPEG:
+            if isinstance(thumb.data, bytes):
+                return thumb.data
+    except Exception:
+        pass
+    return None
+
+
+# EXIF Orientation 标签号 (TIFF/EXIF 0x0112)
+ORIENTATION_TAG = 274
+
+
+def _get_orientation_from_file(path: str) -> int:
+    """
+    从文件中读取 EXIF Orientation 值 (1–8)。
+    先尝试 piexif（JPEG/TIFF/部分 RAW），再尝试 exifread（RAW）。
+    返回 1 表示正常方向或未找到。
+    """
+    try:
+        data = piexif.load(path)
+        for ifd in ("0th", "Exif"):
+            if data.get(ifd) and ORIENTATION_TAG in data[ifd]:
+                v = data[ifd][ORIENTATION_TAG]
+                if isinstance(v, int) and 1 <= v <= 8:
+                    return v
+    except Exception:
+        pass
+    if exifread:
+        try:
+            with open(path, "rb") as f:
+                tags = exifread.process_file(f, details=False)
+            # exifread 中 Orientation 可能在 "Image Orientation" 等
+            for key in ("Image Orientation", "EXIF Orientation"):
+                if key in tags:
+                    try:
+                        v = int(tags[key].values[0])
+                        if 1 <= v <= 8:
+                            return v
+                    except (IndexError, ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+    return 1
+
+
+def _apply_orientation_to_pixmap(pix: QPixmap, orientation: int) -> QPixmap:
+    """
+    根据 EXIF Orientation (1–8) 对 QPixmap 做旋转/翻转，返回新 QPixmap。
+    标准仅此标签 (274) 决定显示方向；竖拍常见为 6(90° CW) / 8(270° CW)，
+    部分相机/RAW 写入方向与常见约定相反，故 6/8 在此处互换以修正竖版倒置。
+    """
+    if orientation == 1 or pix.isNull():
+        return pix
+    tr = QTransform()
+    if orientation == 2:
+        tr.scale(-1, 1)
+    elif orientation == 3:
+        tr.rotate(180)
+    elif orientation == 4:
+        tr.scale(1, -1)
+    elif orientation == 5:
+        tr.rotate(-90)
+        tr.scale(-1, 1)
+    elif orientation == 6:
+        tr.rotate(90)   # 竖拍：与 8 互换以兼容部分相机/RAW 的相反约定
+    elif orientation == 7:
+        tr.rotate(90)
+        tr.scale(-1, 1)
+    elif orientation == 8:
+        tr.rotate(-90)  # 竖拍：与 6 互换以兼容部分相机/RAW 的相反约定
+    else:
+        return pix
+    return pix.transformed(tr, _SmoothTransformation)
+
+
+def _load_preview_pixmap_with_orientation(path: str) -> QPixmap | None:
+    """
+    加载图片并应用 EXIF 方向，使竖拍照片以竖版显示。
+    仅对 PIL 可解码的格式（JPEG/PNG/WebP/TIFF 等）应用；失败或 RAW 时返回 None，由调用方回退。
+    """
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            w, h = img.size
+            data = img.tobytes()
+        bpl = w * 3
+        fmt = QImage.Format.Format_RGB888 if hasattr(QImage.Format, "Format_RGB888") else QImage.Format_RGB888
+        qimg = QImage(data, w, h, bpl, fmt)
+        if qimg.isNull():
+            return None
+        return QPixmap.fromImage(qimg)
+    except Exception:
+        return None
+
+
+def load_exif_exifread(path: str) -> list[tuple[str, str, str]]:
+    """使用 ExifRead 加载 EXIF（用于 RAW 等 piexif 不支持或失败时）。返回 [(group, name, value), ...]。"""
+    if exifread is None:
+        return []
+    rows = []
+    try:
+        with open(path, "rb") as f:
+            tags = exifread.process_file(f, details=True, extract_thumbnail=False)
+        for key, tag in tags.items():
+            if key in ("JPEGThumbnail", "TIFFThumbnail", "Filename"):
+                continue
+            # key 形如 "Image Make"、"EXIF DateTimeOriginal"
+            if " " in key:
+                group, name = key.split(None, 1)
+            else:
+                group, name = "ExifRead", key
+            try:
+                value_str = str(tag.printable) if hasattr(tag, "printable") else str(tag)
+            except Exception:
+                value_str = str(tag)
+            value_str = _sanitize_display_string(value_str)
+            rows.append((group, name, value_str))
+    except Exception:
+        pass
+    return rows
+
+
 def load_exif_pillow(path: str) -> list[tuple[str, str, str]]:
     """使用 Pillow 加载 EXIF（作为补充，如 PNG 等）。返回 [(ifd, name, value), ...]。"""
     rows = []
@@ -256,10 +583,11 @@ def load_exif_pillow(path: str) -> list[tuple[str, str, str]]:
                     if not value.strip(b"\x00"):
                         rows.append(("Pillow Exif", str(name), "（无内容）"))
                         continue
-                if len(value) > 512 or _looks_binary(value):
-                    value = value.hex() if len(value) <= 64 else value.hex() + "..."
+                s = _safe_decode_bytes(value)
+                if _decoded_looks_text(s):
+                    value = s[:2048] + ("\n... (已截断)" if len(s) > 2048 else "")
                 else:
-                    value = _safe_decode_bytes(value)
+                    value = value.hex() if len(value) <= 64 else value.hex() + "..."
             else:
                 value = _sanitize_display_string(str(value))
             rows.append(("Pillow Exif", str(name), value))
@@ -298,6 +626,9 @@ def _parse_value_back(s: str, raw_value) -> tuple | bytes | int:
             except ValueError:
                 pass
             return raw_value
+        # XMLPacket / XMP 等：原为整数元组（字节），编辑后按 UTF-8 写回 bytes
+        if len(raw_value) > 2 and all(isinstance(x, int) and 0 <= x <= 255 for x in raw_value):
+            return s.encode("utf-8")
         if all(isinstance(x, int) for x in raw_value):
             try:
                 return tuple(int(x) for x in s.replace(",", " ").split())
@@ -326,36 +657,29 @@ def get_all_exif_tag_keys() -> list[tuple]:
 
 def load_tag_priority_from_settings() -> list:
     """从与主程序同目录的 EXIF.cfg 读取优先显示的 tag key 列表。"""
-    path = _get_config_path()
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        val = data.get("exif_tag_priority", [])
-        return list(val) if isinstance(val, list) else []
-    except Exception:
-        return []
+    data = _load_settings()
+    val = data.get("exif_tag_priority", [])
+    return list(val) if isinstance(val, list) else []
 
 
 def save_tag_priority_to_settings(priority_keys: list):
     """将优先显示的 tag key 列表写入与主程序同目录的 EXIF.cfg。"""
-    path = _get_config_path()
-    try:
-        data = {}
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                pass
-        if not isinstance(data, dict):
-            data = {}
-        data["exif_tag_priority"] = list(priority_keys)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    data = _load_settings()
+    data["exif_tag_priority"] = list(priority_keys)
+    _save_settings(data)
+
+
+def load_about_info_from_settings() -> dict:
+    """从 EXIF.cfg 读取“关于”信息，缺失字段使用默认值。"""
+    data = _load_settings()
+    about = data.get("about", {})
+    result = dict(ABOUT_INFO_DEFAULT)
+    if isinstance(about, dict):
+        for key in ABOUT_INFO_DEFAULT:
+            value = about.get(key)
+            if isinstance(value, str) and value.strip():
+                result[key] = _sanitize_display_string(value)
+    return result
 
 
 def apply_tag_priority(rows: list[tuple], priority_keys: list[str]) -> list[tuple]:
@@ -408,6 +732,9 @@ def load_all_exif(path: str) -> list[tuple]:
                 rows.append((ifd_name, tag_id, group, name, format_exif_value(value), raw))
         if data.get("thumbnail"):
             rows.append((None, None, IFD_DISPLAY_NAMES["thumbnail"], "（存在）", "是", None))
+    if not rows and Path(path).suffix.lower() in RAW_EXTENSIONS and exifread:
+        for group, name, value in load_exif_exifread(path):
+            rows.append((None, None, group, name, value, None))
     if not rows:
         for group, name, value in load_exif_pillow(path):
             rows.append((None, None, group, name, value, None))
@@ -433,8 +760,28 @@ class DropZone(QLabel):
 
     def set_image(self, path: str):
         self._current_path = path
-        pix = QPixmap(path)
-        if not pix.isNull():
+        pix = _load_preview_pixmap_with_orientation(path)
+        is_raw = Path(path).suffix.lower() in RAW_EXTENSIONS
+        if (pix is None or pix.isNull()) and is_raw:
+            thumb_data = get_raw_thumbnail(path)
+            if thumb_data:
+                pix = QPixmap()
+                if pix.loadFromData(thumb_data):
+                    pix = _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
+                    self._pixmap = pix.scaled(
+                        self.size().width() - 20,
+                        self.size().height() - 20,
+                        _KeepAspectRatio,
+                        _SmoothTransformation,
+                    )
+                    self.setPixmap(self._pixmap)
+                    self.setText("")
+                    return
+        if pix is None or pix.isNull():
+            pix = QPixmap(path)
+        if pix is not None and not pix.isNull():
+            if is_raw:
+                pix = _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
             self._pixmap = pix.scaled(
                 self.size().width() - 20,
                 self.size().height() - 20,
@@ -445,6 +792,7 @@ class DropZone(QLabel):
             self.setText("")
         else:
             self._pixmap = None
+            self.setPixmap(QPixmap())
             self.setText(f"无法预览\n{Path(path).name}")
 
     def clear_image(self):
@@ -459,23 +807,33 @@ class DropZone(QLabel):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._pixmap and self._current_path:
-            pix = QPixmap(self._current_path)
+            path = self._current_path
+            pix = _load_preview_pixmap_with_orientation(path)
+            if pix is None or pix.isNull():
+                pix = QPixmap(path)
+            if pix is None or pix.isNull():
+                pix = self._pixmap  # RAW 等无法直接解码时，用当前缩略图重新缩放
             if not pix.isNull():
+                is_raw = Path(path).suffix.lower() in RAW_EXTENSIONS
+                if is_raw and pix is not self._pixmap:
+                    pix = _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
                 self._pixmap = pix.scaled(
-                self.size().width() - 20,
-                self.size().height() - 20,
-                _KeepAspectRatio,
-                _SmoothTransformation,
+                    self.size().width() - 20,
+                    self.size().height() - 20,
+                    _KeepAspectRatio,
+                    _SmoothTransformation,
                 )
                 self.setPixmap(self._pixmap)
 
     def mousePressEvent(self, event):
         if event.button() == _LeftButton:
+            std_exts = " ".join(f"*{e}" for e in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"))
+            raw_exts = " ".join(f"*{e}" for e in RAW_EXTENSIONS)
             path, _ = QFileDialog.getOpenFileName(
                 self,
                 "选择图片",
                 os.path.expanduser("~"),
-                "图片 (*.jpg *.jpeg *.png *.webp *.tiff *.tif);;全部 (*.*)",
+                f"图片 ({std_exts});;RAW ({raw_exts});;全部 (*.*)",
             )
             if path:
                 self.set_image(path)
@@ -488,14 +846,7 @@ class DropZone(QLabel):
             urls = event.mimeData().urls()
             if urls:
                 path = urls[0].toLocalFile()
-                if path and Path(path).suffix.lower() in (
-                    ".jpg",
-                    ".jpeg",
-                    ".png",
-                    ".webp",
-                    ".tiff",
-                    ".tif",
-                ):
+                if path and Path(path).suffix.lower() in IMAGE_EXTENSIONS:
                     event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
@@ -756,9 +1107,18 @@ class ExifTagOrderDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SuperEXIF - 图片 EXIF 查看器")
+        info = load_about_info_from_settings()
+        version = info.get("version", "").strip()
+        title = f"SuperEXIF - 图片 EXIF 查看与编辑器 by osk.ch"
+        if version:
+            title = f"SuperEXIF {version} - 图片 EXIF 查看与编辑器 by osk.ch"
+        self.setWindowTitle(title)
         self.setMinimumSize(900, 600)
         self.resize(1000, 700)
+        self._init_menu_bar()
+        icon_path = _get_app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -769,10 +1129,47 @@ class MainWindow(QMainWindow):
         # 并排：左侧图片，右侧 EXIF
         splitter = QSplitter(_Horizontal)
 
-        # 左侧：文件名 + 拖放区
+        # 左侧：App 信息 + 文件名 + 拖放区（垂直一组）
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
+
+        # App 信息区：图标 + 主副标题 + “关于...”
+        app_info_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
+        app_info_widget = QWidget()
+        app_info_layout = QHBoxLayout(app_info_widget)
+        app_info_layout.setContentsMargins(0, 0, 0, 12)
+        if app_info_path:
+            icon_label = QLabel()
+            pix = QPixmap(app_info_path)
+            icon_label.setPixmap(pix.scaled(64, 64, _KeepAspectRatio, _SmoothTransformation))
+            icon_label.setFixedSize(64, 64)
+            app_info_layout.addWidget(icon_label)
+        text_col = QWidget()
+        text_layout = QVBoxLayout(text_col)
+        text_layout.setContentsMargins(8, 0, 0, 0)
+        text_layout.setSpacing(0)
+        _align_top = getattr(Qt.AlignmentFlag, "AlignTop", None) or getattr(Qt, "AlignTop", None)
+        if _align_top is not None:
+            text_layout.setAlignment(_align_top)
+        title_label = QLabel("Super EXIF")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #eee; margin: 0; padding: 0;")
+        text_layout.addWidget(title_label)
+        subtitle_label = QLabel("查看与编辑EXIF")
+        subtitle_label.setStyleSheet("font-size: 12px; color: #999; margin: 0; padding: 0;")
+        text_layout.addWidget(subtitle_label)
+        about_btn = QPushButton("关于...")
+        about_btn.setFlat(True)
+        about_btn.setStyleSheet("QPushButton { color: #7eb8ed; text-align: left; padding: 0; margin: 0; min-height: 0; } QPushButton:hover { color: #9dd; }")
+        about_btn.setCursor(Qt.CursorShape.PointingHandCursor if hasattr(Qt, "CursorShape") else Qt.PointingHandCursor)
+        about_btn.clicked.connect(self._show_about_dialog)
+        text_layout.addWidget(about_btn)
+        if _align_top is not None:
+            app_info_layout.addWidget(text_col, 1, _align_top)
+        else:
+            app_info_layout.addWidget(text_col, stretch=1)
+        left_layout.addWidget(app_info_widget)
+
         self.file_label = QLabel("未选择图片")
         self.file_label.setStyleSheet("color: #aaa; font-size: 12px;")
         self.file_label.setWordWrap(True)
@@ -792,7 +1189,7 @@ class MainWindow(QMainWindow):
         self.exif_filter.setStyleSheet("QLineEdit { padding: 6px; font-size: 13px; }")
         self.exif_filter.textChanged.connect(self._on_exif_filter_changed)
         top_row.addWidget(self.exif_filter)
-        self.btn_config_order = QPushButton("配置顺序")
+        self.btn_config_order = QPushButton("配置显示顺序")
         self.btn_config_order.setToolTip("设置优先显示的 EXIF 标签及顺序")
         self.btn_config_order.clicked.connect(self._open_tag_order_config)
         top_row.addWidget(self.btn_config_order)
@@ -809,6 +1206,36 @@ class MainWindow(QMainWindow):
 
         # drop_zone 加入 left_layout 后 parent 为 left_widget，回调需挂在 left_widget 上
         left_widget.on_image_loaded = self.on_image_loaded
+
+    def _init_menu_bar(self):
+        help_menu = self.menuBar().addMenu("帮助")
+        about_action = QAction("关于...", self)
+        about_action.triggered.connect(self._show_about_dialog)
+        help_menu.addAction(about_action)
+
+    def _show_about_dialog(self):
+        info = load_about_info_from_settings()
+        title = f"{info['app_name']} {info['version']}".strip()
+        lines = [
+            f"<b>{escape(title)}</b>",
+            escape(info["tagline"]),
+            "",
+            escape(info["description"]),
+        ]
+        if info.get("author"):
+            lines.append(f"作者：{escape(info['author'])}")
+        if info.get("website"):
+            lines.append(f"网站：{escape(info['website'])}")
+        if info.get("license"):
+            lines.append(f"许可：{escape(info['license'])}")
+        if info.get("copyright"):
+            lines.append(escape(info["copyright"]))
+        msg = QMessageBox(self)
+        msg.setIcon(_MsgInfo)
+        msg.setWindowTitle(f"关于 {info['app_name']}")
+        msg.setText("<br>".join("&nbsp;" if not line else line for line in lines))
+        msg.setStandardButtons(_MsgOk)
+        msg.exec()
 
     def _on_exif_filter_changed(self, text: str):
         self.exif_table.set_filter_text(text)
@@ -855,7 +1282,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "无 EXIF",
-                "该图片未包含 EXIF 信息或格式暂不支持。\n支持格式：JPEG、WebP、TIFF（piexif）；其他格式会尝试用 Pillow 读取。",
+                "该图片未包含 EXIF 信息或格式暂不支持。\n支持格式：JPEG、WebP、TIFF（piexif）；各家相机 RAW（CR2/NEF/ARW/DNG 等，可选 exifread）；其他格式会尝试用 Pillow 读取。",
             )
         else:
             rows = apply_tag_priority(rows, load_tag_priority_from_settings())
@@ -864,6 +1291,16 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    about_info = load_about_info_from_settings()
+    if hasattr(app, "setApplicationName"):
+        app.setApplicationName(about_info.get("app_name", "SuperEXIF"))
+    if hasattr(app, "setApplicationDisplayName"):
+        app.setApplicationDisplayName(about_info.get("app_name", "SuperEXIF"))
+    if hasattr(app, "setApplicationVersion"):
+        app.setApplicationVersion(about_info.get("version", ""))
+    icon_path = _get_app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
     app.setStyle("Fusion")
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor(45, 45, 45))

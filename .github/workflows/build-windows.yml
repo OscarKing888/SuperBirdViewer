@@ -1,0 +1,65 @@
+name: build-windows-exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path "requirements.txt") { pip install -r requirements.txt }
+          pip install pyinstaller
+
+      - name: Build (run your bat)
+        shell: cmd
+        run: |
+          scripts\build_win.bat
+
+      - name: Pack zip
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\\SuperEXIF")) {
+            throw "dist\\SuperEXIF not found"
+          }
+          Compress-Archive -Path "dist\\SuperEXIF\\*" -DestinationPath "dist\\SuperEXIF-windows.zip" -Force
+
+      - name: Upload artifacts (exe + folder + zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuperEXIF-windows
+          if-no-files-found: error
+          path: |
+            dist\SuperEXIF\SuperEXIF.exe
+            dist\SuperEXIF\**
+            dist\SuperEXIF-windows.zip
+          retention-days: 14
+
+      - name: Publish GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SuperEXIF/SuperEXIF.exe
+            dist/SuperEXIF-windows.zip
