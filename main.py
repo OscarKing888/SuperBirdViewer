@@ -401,8 +401,8 @@ def format_exif_value(value):
     return str(value)
 
 
-# 常用 EXIF 标签的中文名（ifd_name:tag_id -> 中文）。未在此的用 piexif 英文名。
-EXIF_TAG_NAMES_ZH = {
+# cfg 中无 exif_tag_names_zh 时的内置默认（可被 EXIF.cfg 覆盖）
+DEFAULT_EXIF_TAG_NAMES_ZH = {
     "0th:256": "图像宽度", "0th:257": "图像高度", "0th:258": "每像素位数",
     "0th:271": "制造商", "0th:272": "型号", "0th:274": "方向", "0th:282": "X 分辨率",
     "0th:283": "Y 分辨率", "0th:296": "分辨率单位", "0th:306": "日期时间",
@@ -418,13 +418,24 @@ EXIF_TAG_NAMES_ZH = {
 }
 
 
+def load_exif_tag_names_zh_from_settings() -> dict:
+    """从 EXIF.cfg 读取 EXIF 标签中文名映射（key 为 ifd_name:tag_id），缺省用内置默认。"""
+    data = _load_settings()
+    val = data.get("exif_tag_names_zh")
+    if isinstance(val, dict) and val:
+        return dict(val)
+    return DEFAULT_EXIF_TAG_NAMES_ZH.copy()
+
+
 def get_tag_name(ifd_name: str, tag_id: int, use_chinese: bool = False) -> str:
-    """获取 tag 的可读名称。use_chinese=True 时优先返回中文（若有映射）。"""
+    """获取 tag 的可读名称。use_chinese=True 时优先返回 cfg 中的中文（若有映射）。"""
     if ifd_name == "thumbnail":
         return "（二进制数据）"
     key = f"{ifd_name}:{tag_id}"
-    if use_chinese and key in EXIF_TAG_NAMES_ZH:
-        return EXIF_TAG_NAMES_ZH[key]
+    if use_chinese:
+        names_zh = load_exif_tag_names_zh_from_settings()
+        if key in names_zh:
+            return names_zh[key]
     t = piexif.TAGS.get(ifd_name, {})
     info = t.get(tag_id)
     if info is None:
@@ -1172,8 +1183,8 @@ class MainWindow(QMainWindow):
         if version:
             title = f"SuperEXIF {version} - 图片 EXIF 查看与编辑器 by osk.ch"
         self.setWindowTitle(title)
-        self.setMinimumSize(900, 600)
-        self.resize(1000, 700)
+        self.setMinimumSize(600, 800)
+        self.resize(1080, 1920)
         self._init_menu_bar()
         icon_path = _get_app_icon_path()
         if icon_path:
