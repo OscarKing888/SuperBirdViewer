@@ -37,6 +37,7 @@ try:
         QScrollArea,
         QGroupBox,
         QGridLayout,
+        QCheckBox,
     )
     from PyQt6.QtCore import Qt, QMimeData, QSize
     from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
@@ -66,6 +67,7 @@ except ImportError:
         QScrollArea,
         QGroupBox,
         QGridLayout,
+        QCheckBox,
     )
     from PyQt5.QtCore import Qt, QMimeData, QSize
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
@@ -399,10 +401,30 @@ def format_exif_value(value):
     return str(value)
 
 
-def get_tag_name(ifd_name: str, tag_id: int) -> str:
-    """获取 tag 的可读名称。piexif.TAGS[ifd][tag_id] 为 {'name': '...', 'type': ...}。"""
+# 常用 EXIF 标签的中文名（ifd_name:tag_id -> 中文）。未在此的用 piexif 英文名。
+EXIF_TAG_NAMES_ZH = {
+    "0th:256": "图像宽度", "0th:257": "图像高度", "0th:258": "每像素位数",
+    "0th:271": "制造商", "0th:272": "型号", "0th:274": "方向", "0th:282": "X 分辨率",
+    "0th:283": "Y 分辨率", "0th:296": "分辨率单位", "0th:306": "日期时间",
+    "0th:315": "作者", "0th:318": "色彩空间",
+    "Exif:33434": "曝光时间", "Exif:33437": "光圈", "Exif:34850": "曝光程序",
+    "Exif:34855": "ISO", "Exif:36864": "Exif 版本", "Exif:36867": "拍摄时间",
+    "Exif:36868": "数字化时间", "Exif:37378": "曝光补偿", "Exif:37379": "测光模式",
+    "Exif:37386": "焦距", "Exif:41985": "亮度", "Exif:41986": "曝光模式",
+    "Exif:41987": "白平衡", "Exif:41990": "场景类型", "Exif:42036": "镜头型号",
+    "Exif:40962": "图像宽度(Exif)", "Exif:40963": "图像高度(Exif)",
+    "GPS:1": "GPS 纬度", "GPS:2": "GPS 经度", "GPS:3": "GPS 纬度参考",
+    "GPS:4": "GPS 经度参考", "GPS:29": "GPS 日期",
+}
+
+
+def get_tag_name(ifd_name: str, tag_id: int, use_chinese: bool = False) -> str:
+    """获取 tag 的可读名称。use_chinese=True 时优先返回中文（若有映射）。"""
     if ifd_name == "thumbnail":
         return "（二进制数据）"
+    key = f"{ifd_name}:{tag_id}"
+    if use_chinese and key in EXIF_TAG_NAMES_ZH:
+        return EXIF_TAG_NAMES_ZH[key]
     t = piexif.TAGS.get(ifd_name, {})
     info = t.get(tag_id)
     if info is None:
@@ -637,7 +659,7 @@ def _parse_value_back(s: str, raw_value) -> tuple | bytes | int:
     return s.encode("utf-8")
 
 
-def get_all_exif_tag_keys() -> list[tuple]:
+def get_all_exif_tag_keys(use_chinese: bool = False) -> list[tuple]:
     """
     从 piexif.TAGS 收集所有可配置的 (key, 显示文本)。
     key = "ifd_name:tag_id"，显示文本 = "分组 - 标签名"。
@@ -649,23 +671,55 @@ def get_all_exif_tag_keys() -> list[tuple]:
             continue
         group = IFD_DISPLAY_NAMES.get(ifd_name, ifd_name)
         for tag_id, info in ifd_data.items():
-            name = info.get("name", f"Tag {tag_id}") if isinstance(info, dict) else str(info)
+            name = get_tag_name(ifd_name, tag_id, use_chinese=use_chinese)
             key = f"{ifd_name}:{tag_id}"
             result.append((key, f"{group} - {name}"))
     return result
 
 
+# 内置默认显示顺序：相机、镜头、曝光、ISO、时间等常用项
+DEFAULT_EXIF_TAG_PRIORITY = [
+    "0th:271",   # Make 制造商
+    "0th:272",   # Model 型号
+    "0th:306",   # DateTime
+    "Exif:33434",  # ExposureTime 曝光时间
+    "Exif:33437",  # FNumber 光圈
+    "Exif:34855",  # ISOSpeedRatings
+    "Exif:36867",  # DateTimeOriginal 拍摄时间
+    "Exif:37386",  # FocalLength 焦距
+    "Exif:42036",  # LensModel 镜头型号
+    "Exif:41987",  # WhiteBalance 白平衡
+    "Exif:37378",  # ExposureBias 曝光补偿
+    "Exif:40962",  # ExifImageWidth
+    "Exif:40963",  # ExifImageLength
+]
+
+
 def load_tag_priority_from_settings() -> list:
-    """从与主程序同目录的 EXIF.cfg 读取优先显示的 tag key 列表。"""
+    """从 EXIF.cfg 读取优先显示的 tag key 列表，缺省时返回内置默认顺序。"""
     data = _load_settings()
     val = data.get("exif_tag_priority", [])
-    return list(val) if isinstance(val, list) else []
+    lst = list(val) if isinstance(val, list) else []
+    return lst if lst else DEFAULT_EXIF_TAG_PRIORITY.copy()
 
 
 def save_tag_priority_to_settings(priority_keys: list):
-    """将优先显示的 tag key 列表写入与主程序同目录的 EXIF.cfg。"""
+    """将优先显示的 tag key 列表写入 EXIF.cfg。"""
     data = _load_settings()
     data["exif_tag_priority"] = list(priority_keys)
+    _save_settings(data)
+
+
+def load_tag_label_chinese_from_settings() -> bool:
+    """是否使用中文显示 EXIF 标签名。"""
+    data = _load_settings()
+    return bool(data.get("exif_tag_label_chinese", False))
+
+
+def save_tag_label_chinese_to_settings(use_chinese: bool):
+    """保存 EXIF 标签名显示语言。"""
+    data = _load_settings()
+    data["exif_tag_label_chinese"] = use_chinese
     _save_settings(data)
 
 
@@ -703,10 +757,10 @@ def apply_tag_priority(rows: list[tuple], priority_keys: list[str]) -> list[tupl
     return sorted(rows, key=sort_key)
 
 
-def load_all_exif(path: str) -> list[tuple]:
+def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
     """
     加载全部 EXIF，返回 [(ifd_name, tag_id, 分组, 标签名, 值字符串, raw_value), ...]。
-    ifd_name/tag_id 为 None 表示不可编辑（Pillow/缩略图等）。
+    tag_label_chinese 为 True 时标签名使用中文（若有映射）。
     """
     rows = []
     data = load_exif_piexif(path)
@@ -717,7 +771,7 @@ def load_all_exif(path: str) -> list[tuple]:
                 continue
             group = IFD_DISPLAY_NAMES.get(ifd_name, ifd_name)
             for tag_id, value in ifd_data.items():
-                name = get_tag_name(ifd_name, tag_id)
+                name = get_tag_name(ifd_name, tag_id, use_chinese=tag_label_chinese)
                 raw = value
                 # UserComment (Exif 37510) 前 8 字节为字符编码标识，需去掉再按文本解码显示（避免被当作二进制显示为 hex）
                 if ifd_name == "Exif" and tag_id == 37510 and isinstance(value, bytes) and len(value) > 8:
@@ -869,6 +923,7 @@ class ExifTable(QTableWidget):
         self.setColumnCount(3)
         self.setHorizontalHeaderLabels(["分组", "标签", "值"])
         self.horizontalHeader().setSectionResizeMode(2, _ResizeStretch)
+        self.setColumnWidth(1, 220)  # “标签”列加宽以便显示全
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(_SelectRows)
         self.setEditTriggers(_DoubleClicked)
@@ -888,6 +943,10 @@ class ExifTable(QTableWidget):
     def set_exif(self, rows: list[tuple]):
         self._all_rows = list(rows)
         self._apply_filter(self._filter_text)
+
+    def get_all_rows(self) -> list[tuple]:
+        """返回当前全部行数据（用于切换标签语言时重算标签名）。"""
+        return list(self._all_rows)
 
     def set_filter_text(self, text):
         self._filter_text = str(text or "").strip()
@@ -968,7 +1027,7 @@ class ExifTable(QTableWidget):
 class ExifTagOrderDialog(QDialog):
     """配置 EXIF 标签优先显示顺序的对话框。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, use_chinese: bool = False):
         super().__init__(parent)
         self.setWindowTitle("EXIF 显示顺序")
         self.setMinimumSize(420, 380)
@@ -1002,7 +1061,7 @@ class ExifTagOrderDialog(QDialog):
         bbox.rejected.connect(self.reject)
         layout.addWidget(bbox)
         self._priority_keys = []
-        self._all_tags = get_all_exif_tag_keys()
+        self._all_tags = get_all_exif_tag_keys(use_chinese=use_chinese)
         self._load_from_settings()
 
     def _load_from_settings(self):
@@ -1189,6 +1248,11 @@ class MainWindow(QMainWindow):
         self.exif_filter.setStyleSheet("QLineEdit { padding: 6px; font-size: 13px; }")
         self.exif_filter.textChanged.connect(self._on_exif_filter_changed)
         top_row.addWidget(self.exif_filter)
+        self.check_tag_chinese = QCheckBox("中文标签")
+        self.check_tag_chinese.setChecked(load_tag_label_chinese_from_settings())
+        self.check_tag_chinese.setToolTip("勾选显示汉字标签名，否则显示英文")
+        self.check_tag_chinese.toggled.connect(self._on_tag_label_lang_toggled)
+        top_row.addWidget(self.check_tag_chinese)
         self.btn_config_order = QPushButton("配置显示顺序")
         self.btn_config_order.setToolTip("设置优先显示的 EXIF 标签及顺序")
         self.btn_config_order.clicked.connect(self._open_tag_order_config)
@@ -1215,9 +1279,28 @@ class MainWindow(QMainWindow):
 
     def _show_about_dialog(self):
         info = load_about_info_from_settings()
+        d = QDialog(self)
+        d.setWindowTitle(f"关于 {info['app_name']}")
+        d.setMinimumSize(480, 320)
+        main_layout = QVBoxLayout(d)
+        main_layout.setSpacing(24)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        content = QHBoxLayout()
+        content.setSpacing(24)
+        # 左侧：LOGO
+        logo_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
+        if logo_path:
+            pix = QPixmap(logo_path)
+            if not pix.isNull():
+                pix = pix.scaled(128, 128, _KeepAspectRatio, _SmoothTransformation)
+                logo_label = QLabel()
+                logo_label.setPixmap(pix)
+                logo_label.setAlignment(_AlignCenter)
+                content.addWidget(logo_label)
+        # 右侧：App 信息
         title = f"{info['app_name']} {info['version']}".strip()
         lines = [
-            f"<b>{escape(title)}</b>",
+            f"<b style='font-size:14px'>{escape(title)}</b>",
             escape(info["tagline"]),
             "",
             escape(info["description"]),
@@ -1230,21 +1313,44 @@ class MainWindow(QMainWindow):
             lines.append(f"许可：{escape(info['license'])}")
         if info.get("copyright"):
             lines.append(escape(info["copyright"]))
-        msg = QMessageBox(self)
-        msg.setIcon(_MsgInfo)
-        msg.setWindowTitle(f"关于 {info['app_name']}")
-        msg.setText("<br>".join("&nbsp;" if not line else line for line in lines))
-        msg.setStandardButtons(_MsgOk)
-        msg.exec()
+        text = "<br>".join("&nbsp;" if not line else line for line in lines)
+        info_label = QLabel(text)
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("font-size: 12px; line-height: 1.4;")
+        info_label.setTextFormat(Qt.TextFormat.RichText if hasattr(Qt, "TextFormat") else Qt.RichText)
+        content.addWidget(info_label, stretch=1)
+        main_layout.addLayout(content)
+        btn = QPushButton("确定")
+        btn.setDefault(True)
+        btn.clicked.connect(d.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(btn)
+        main_layout.addLayout(btn_row)
+        d.exec()
 
     def _on_exif_filter_changed(self, text: str):
         self.exif_table.set_filter_text(text)
 
+    def _on_tag_label_lang_toggled(self, checked: bool):
+        save_tag_label_chinese_to_settings(checked)
+        rows = self.exif_table.get_all_rows()
+        if not rows:
+            return
+        new_rows = [
+            (r[0], r[1], r[2],
+             get_tag_name(r[0], r[1], use_chinese=checked) if (r[0] is not None and r[1] is not None) else r[3],
+             r[4], r[5])
+            for r in rows
+        ]
+        self.exif_table.set_exif(new_rows)
+
     def _open_tag_order_config(self):
-        d = ExifTagOrderDialog(self)
+        use_chinese = load_tag_label_chinese_from_settings()
+        d = ExifTagOrderDialog(self, use_chinese=use_chinese)
         if d.exec():
             if self._current_exif_path and os.path.isfile(self._current_exif_path):
-                rows = load_all_exif(self._current_exif_path)
+                rows = load_all_exif(self._current_exif_path, tag_label_chinese=use_chinese)
                 rows = apply_tag_priority(rows, load_tag_priority_from_settings())
                 self.exif_table.set_exif(rows)
 
@@ -1266,7 +1372,7 @@ class MainWindow(QMainWindow):
             data[ifd_name][tag_id] = new_raw
             exif_bytes = piexif.dump(data)
             piexif.insert(exif_bytes, path)
-            rows = load_all_exif(path)
+            rows = load_all_exif(path, tag_label_chinese=load_tag_label_chinese_from_settings())
             self.exif_table.set_exif(rows)
             QMessageBox.information(self, "已保存", "EXIF 已写入文件。")
         except Exception as e:
@@ -1277,7 +1383,7 @@ class MainWindow(QMainWindow):
         self._current_exif_path = path
         self.file_label.setText(path)
         self.file_label.setToolTip(path)
-        rows = load_all_exif(path)
+        rows = load_all_exif(path, tag_label_chinese=load_tag_label_chinese_from_settings())
         if not rows:
             QMessageBox.information(
                 self,

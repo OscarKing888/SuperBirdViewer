@@ -1,0 +1,65 @@
+name: build-macos-app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pyinstaller
+
+      - name: Build (run your shell script)
+        shell: bash
+        run: |
+          bash scripts/build_mac.sh
+
+      - name: Pack app zip
+        shell: bash
+        run: |
+          if [ ! -d "dist/SuperEXIF.app" ]; then
+            echo "dist/SuperEXIF.app not found"
+            exit 1
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "dist/SuperEXIF.app" "dist/SuperEXIF-macos.zip"
+
+      - name: Upload artifacts (app + zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuperEXIF-macos
+          if-no-files-found: error
+          path: |
+            dist/SuperEXIF.app
+            dist/SuperEXIF-macos.zip
+          retention-days: 14
+
+      - name: Publish GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SuperEXIF-macos.zip
+          overwrite_files: true
