@@ -41,6 +41,7 @@ try:
         QGroupBox,
         QGridLayout,
         QCheckBox,
+        QTabWidget,
     )
     from PyQt6.QtCore import Qt, QMimeData, QSize
     from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
@@ -71,6 +72,7 @@ except ImportError:
         QGroupBox,
         QGridLayout,
         QCheckBox,
+        QTabWidget,
     )
     from PyQt5.QtCore import Qt, QMimeData, QSize
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
@@ -1470,6 +1472,29 @@ def save_tag_priority_to_settings(priority_keys: list):
     _save_settings(data)
 
 
+def load_exif_tag_hidden_from_settings() -> set:
+    """从 EXIF.cfg 读取禁止显示的 tag key 集合（ifd:tag_id），如 0th:279。仅由 cfg 配置，无默认项。"""
+    data = _load_settings()
+    val = data.get("exif_tag_hidden", [])
+    lst = val if isinstance(val, list) else []
+    return {str(k).strip() for k in lst if isinstance(k, str) and k.strip()}
+
+
+def save_exif_tag_hidden_to_settings(hidden_keys: list):
+    """将禁止显示的 tag key 列表写入 EXIF.cfg。"""
+    data = _load_settings()
+    normalized = []
+    seen = set()
+    for k in (list(hidden_keys) if isinstance(hidden_keys, list) else []):
+        s = str(k).strip() if k is not None else ""
+        if not s or s in seen:
+            continue
+        normalized.append(s)
+        seen.add(s)
+    data["exif_tag_hidden"] = normalized
+    _save_settings(data)
+
+
 def load_tag_label_chinese_from_settings() -> bool:
     """是否使用中文显示 EXIF 标签名。"""
     data = _load_settings()
@@ -1602,6 +1627,7 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
             desc_raw_value,
         )
     )
+    hidden_keys = load_exif_tag_hidden_from_settings()
     if data:
         hyperfocal_m = _calc_hyperfocal_distance_m(data, default_coc_mm=load_hyperfocal_coc_mm_from_settings())
         rows.append(
@@ -1620,6 +1646,8 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
                 continue
             group = IFD_DISPLAY_NAMES.get(ifd_name, ifd_name)
             for tag_id, value in ifd_data.items():
+                if f"{ifd_name}:{tag_id}" in hidden_keys:
+                    continue
                 # 前置“描述”已有值时，隐藏后续重复的 ImageDescription(0th:270)
                 if has_front_desc and ifd_name == "0th" and tag_id == 270:
                     continue
@@ -1884,17 +1912,24 @@ class ExifTable(QTableWidget):
 
 
 class ExifTagOrderDialog(QDialog):
-    """配置 EXIF 标签优先显示顺序的对话框。"""
+    """配置 EXIF 标签优先显示顺序与禁止显示列表的对话框。"""
 
     def __init__(self, parent=None, use_chinese: bool = False):
         super().__init__(parent)
         self.setWindowTitle("EXIF 显示顺序")
-        self.setMinimumSize(420, 380)
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("以下标签将优先显示在 EXIF 列表顶部，按顺序排列："))
+        self.setMinimumSize(480, 420)
+        self._all_tags = get_all_exif_tag_keys(use_chinese=use_chinese)
+        self._priority_keys = []
+        self._hidden_keys = []  # 列表顺序用于保存到 cfg
+
+        tabs = QTabWidget()
+        # Tab1: 显示顺序
+        order_w = QWidget()
+        order_layout = QVBoxLayout(order_w)
+        order_layout.addWidget(QLabel("以下标签将优先显示在 EXIF 列表顶部，按顺序排列："))
         self.list_widget = QListWidget()
         self.list_widget.setAlternatingRowColors(True)
-        layout.addWidget(self.list_widget)
+        order_layout.addWidget(self.list_widget)
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         self.btn_up = QPushButton("上移")
@@ -1910,7 +1945,30 @@ class ExifTagOrderDialog(QDialog):
         btn_layout.addWidget(self.btn_remove)
         btn_layout.addWidget(self.btn_add)
         btn_layout.addStretch()
-        layout.addLayout(btn_layout)
+        order_layout.addLayout(btn_layout)
+        tabs.addTab(order_w, "显示顺序")
+
+        # Tab2: 禁止显示
+        hidden_w = QWidget()
+        hidden_layout = QVBoxLayout(hidden_w)
+        hidden_layout.addWidget(QLabel("以下标签将不在 EXIF 列表中显示（格式如 0th:279）："))
+        self.hidden_list_widget = QListWidget()
+        self.hidden_list_widget.setAlternatingRowColors(True)
+        hidden_layout.addWidget(self.hidden_list_widget)
+        hidden_btn = QHBoxLayout()
+        hidden_btn.addStretch()
+        self.btn_hidden_add = QPushButton("添加…")
+        self.btn_hidden_add.clicked.connect(self._add_hidden_tag)
+        self.btn_hidden_remove = QPushButton("删除")
+        self.btn_hidden_remove.clicked.connect(self._remove_hidden)
+        hidden_btn.addWidget(self.btn_hidden_add)
+        hidden_btn.addWidget(self.btn_hidden_remove)
+        hidden_btn.addStretch()
+        hidden_layout.addLayout(hidden_btn)
+        tabs.addTab(hidden_w, "禁止显示")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(tabs)
         bbox = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
             if hasattr(QDialogButtonBox.StandardButton, "Ok")
@@ -1919,13 +1977,16 @@ class ExifTagOrderDialog(QDialog):
         bbox.accepted.connect(self.accept)
         bbox.rejected.connect(self.reject)
         layout.addWidget(bbox)
-        self._priority_keys = []
-        self._all_tags = get_all_exif_tag_keys(use_chinese=use_chinese)
         self._load_from_settings()
 
     def _load_from_settings(self):
         self._priority_keys = load_tag_priority_from_settings()
+        data = _load_settings()
+        val = data.get("exif_tag_hidden", [])
+        lst = val if isinstance(val, list) else []
+        self._hidden_keys = [str(k).strip() for k in lst if isinstance(k, str) and k.strip()]
         self._refresh_list()
+        self._refresh_hidden_list()
 
     def _refresh_list(self):
         key_to_text = {k: t for k, t in self._all_tags}
@@ -2014,11 +2075,79 @@ class ExifTagOrderDialog(QDialog):
                 self._priority_keys.append(key)
                 self._refresh_list()
 
+    def _refresh_hidden_list(self):
+        self.hidden_list_widget.clear()
+        key_to_text = {k: t for k, t in self._all_tags}
+        for key in self._hidden_keys:
+            text = key_to_text.get(key, key)
+            item = QListWidgetItem(text)
+            item.setData(_UserRole, key)
+            self.hidden_list_widget.addItem(item)
+
+    def _add_hidden_tag(self):
+        d = QDialog(self)
+        d.setWindowTitle("选择要禁止显示的标签")
+        d.setMinimumSize(400, 350)
+        layout = QVBoxLayout(d)
+        layout.addWidget(QLabel("搜索："))
+        search = QLineEdit()
+        search.setPlaceholderText("输入分组或标签名过滤…")
+        layout.addWidget(search)
+        all_list = QListWidget()
+        existing = set(self._hidden_keys)
+        for key, text in self._all_tags:
+            if key in existing:
+                continue
+            item = QListWidgetItem(text)
+            item.setData(_UserRole, key)
+            all_list.addItem(item)
+        layout.addWidget(all_list)
+
+        def _filter_list(text):
+            t = str(text or "").strip().lower()
+            for i in range(all_list.count()):
+                it = all_list.item(i)
+                it.setHidden(bool(t) and t not in it.text().lower())
+
+        search.textChanged.connect(_filter_list)
+        chosen_key = [None]
+
+        def on_accept():
+            cur = all_list.currentItem()
+            if cur is not None:
+                chosen_key[0] = cur.data(_UserRole)
+            d.accept()
+
+        all_list.doubleClicked.connect(on_accept)
+        bbox = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            if hasattr(QDialogButtonBox.StandardButton, "Ok")
+            else QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        bbox.accepted.connect(on_accept)
+        bbox.rejected.connect(d.reject)
+        layout.addWidget(bbox)
+        if d.exec():
+            key = chosen_key[0]
+            if key and key not in self._hidden_keys:
+                self._hidden_keys.append(key)
+                self._refresh_hidden_list()
+
+    def _remove_hidden(self):
+        row = self.hidden_list_widget.currentRow()
+        if row < 0:
+            return
+        self._hidden_keys.pop(row)
+        self._refresh_hidden_list()
+        if self.hidden_list_widget.count():
+            self.hidden_list_widget.setCurrentRow(min(row, self.hidden_list_widget.count() - 1))
+
     def get_priority_keys(self):
         return list(self._priority_keys)
 
     def accept(self):
         save_tag_priority_to_settings(self._priority_keys)
+        save_exif_tag_hidden_to_settings(self._hidden_keys)
         super().accept()
 
 

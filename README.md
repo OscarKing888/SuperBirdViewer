@@ -12,6 +12,8 @@
 [![主界面](./image/manual/MainEng.png)](./image/manual/MainEng.png)
 * 自定义显示顺序
 [![自定义显示顺序](./image/manual/CustomEdit.png)](./image/manual/CustomEdit.png)
+* 自定义隐藏标签
+[![自定义隐藏标签](./image/manual/CustomEditHiddenTag.png)](./image/manual/CustomEditHiddenTag.png)
 
 # 关于作者
 [![关于作者](./image/manual/osk.jpg)](./image/manual/osk.jpg)
