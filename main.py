@@ -149,9 +149,17 @@ try:
 except ImportError:
     rawpy = None
 
-# 支持的图片扩展名（含各家相机 RAW）
+# 可选：HEIC/HEIF 读取与预览（Pillow 需注册后才能 Image.open(heic)）
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pillow_heif = None
+
+# 支持的图片扩展名（含各家相机 RAW 与 HEIC/HEIF）
 IMAGE_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif",
+    ".heic", ".heif", ".hif",
     # Canon
     ".cr2", ".cr3", ".crw",
     # Nikon
@@ -179,8 +187,9 @@ IMAGE_EXTENSIONS = (
 IMAGE_EXTENSIONS = tuple(dict.fromkeys(e.lower() for e in IMAGE_EXTENSIONS))
 RAW_EXTENSIONS = frozenset(
     e for e in IMAGE_EXTENSIONS
-    if e not in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif")
+    if e not in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".heic", ".heif", ".hif")
 )
+HEIF_EXTENSIONS = frozenset({".heic", ".heif", ".hif"})
 PIEXIF_WRITABLE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".jpe", ".webp", ".tif", ".tiff"})
 EXIFTOOL_IFD_GROUP_MAP = {
     "0th": "IFD0",
@@ -201,6 +210,17 @@ META_DESCRIPTION_PRIORITY_KEY = f"{META_IFD_NAME}:{META_DESCRIPTION_TAG_ID}"
 CALC_IFD_NAME = "Calc"
 HYPERFOCAL_TAG_ID = "HyperfocalDistance"
 HYPERFOCAL_PRIORITY_KEY = f"{CALC_IFD_NAME}:{HYPERFOCAL_TAG_ID}"
+# exiftool 中与“标题/描述”语义重复的 key，已在列表前部用 Meta:Title / Meta:Description 显示，不再在后面重复
+EXIFTOOL_KEYS_DUPLICATE_OF_TITLE = frozenset({"XMP-dc:Title", "IFD0:XPTitle", "IFD0:DocumentName"})
+EXIFTOOL_KEYS_DUPLICATE_OF_DESCRIPTION = frozenset(
+    {
+        "XMP-dc:Description",
+        "IFD0:XPComment",
+        "IFD0:ImageDescription",
+        "EXIF:UserComment",
+        "ExifIFD:UserComment",
+    }
+)
 APP_ICON_CANDIDATES = (
     os.path.join("image", "superexif.png"),
     os.path.join("image", "superexif.ico"),
@@ -459,6 +479,70 @@ def _to_float_exif_number(v) -> float | None:
     return None
 
 
+def _to_float_text_number(v) -> float | None:
+    """Parse exiftool values like '1/800', '400 mm', 5.6 into float."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, list):
+        for x in v:
+            f = _to_float_text_number(x)
+            if f is not None:
+                return f
+        return None
+    s = _sanitize_display_string(str(v or "")).strip()
+    if not s:
+        return None
+    if "/" in s:
+        a, _, b = s.partition("/")
+        try:
+            num = float(a.strip())
+            den = float(b.strip().split()[0]) if b.strip() else 0.0
+            if den != 0:
+                return num / den
+        except (TypeError, ValueError):
+            pass
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def _calc_hyperfocal_distance_from_exiftool_obj(obj: dict, default_coc_mm: float = 0.03) -> float | None:
+    """Calculate hyperfocal distance from exiftool json object."""
+    if not isinstance(obj, dict):
+        return None
+
+    def _pick(*keys):
+        for k in keys:
+            if k in obj:
+                f = _to_float_text_number(obj.get(k))
+                if f is not None:
+                    return f
+        return None
+
+    f_mm = _pick("ExifIFD:FocalLength", "EXIF:FocalLength", "Composite:FocalLength")
+    n = _pick("ExifIFD:FNumber", "EXIF:FNumber", "Composite:Aperture")
+    if f_mm is None or n is None or f_mm <= 0 or n <= 0:
+        return None
+
+    coc_mm = default_coc_mm if default_coc_mm > 0 else 0.03
+    focal_35 = _pick("ExifIFD:FocalLengthIn35mmFormat", "EXIF:FocalLengthIn35mmFormat")
+    if focal_35 is not None and focal_35 > 0:
+        crop = focal_35 / f_mm
+        if crop > 0:
+            coc_mm = 0.03 / crop
+    if coc_mm <= 0:
+        coc_mm = 0.03
+
+    h_mm = (f_mm * f_mm) / (n * coc_mm) + f_mm
+    if h_mm <= 0:
+        return None
+    return h_mm / 1000.0
+
+
 def _calc_hyperfocal_distance_m(exif_data: dict, default_coc_mm: float = 0.03) -> float | None:
     """
     计算超焦距（米）。
@@ -493,6 +577,64 @@ def _format_hyperfocal_distance(value_m: float | None) -> str:
     if value_m is None:
         return "无法计算"
     return f"{value_m:.2f} m"
+
+
+def _extract_exiftool_text_value(value) -> str:
+    """Normalize exiftool json value to display text."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for k in ("x-default", "zh-CN", "zh-cn", "en-US", "en-us"):
+            if k in value:
+                s = _extract_exiftool_text_value(value.get(k))
+                if s:
+                    return s
+        for v in value.values():
+            s = _extract_exiftool_text_value(v)
+            if s:
+                return s
+        return ""
+    if isinstance(value, list):
+        parts = [_extract_exiftool_text_value(v) for v in value]
+        parts = [p for p in parts if p]
+        return " ".join(parts)
+    return _sanitize_display_string(str(value))
+
+
+def _is_likely_mojibake_meta_text(s: str) -> bool:
+    """
+    Detect common mojibake pattern like '??ͷѻȸ' (GBK bytes decoded as UTF-8).
+    Keep heuristic conservative: only flag when placeholder + suspicious script mix appears.
+    """
+    txt = _sanitize_display_string(str(s or "")).strip()
+    if not txt:
+        return False
+    has_cjk = any(0x4E00 <= ord(ch) <= 0x9FFF for ch in txt)
+    if has_cjk:
+        return False
+    has_placeholder = ("?" in txt) or ("\ufffd" in txt)
+    has_suspicious_script = any(
+        (0x0370 <= ord(ch) <= 0x052F) or (0x0180 <= ord(ch) <= 0x024F)
+        for ch in txt
+    )
+    return has_placeholder and has_suspicious_script
+
+
+def _pick_preferred_meta_text(*candidates) -> str:
+    """
+    Pick first non-empty candidate; if earlier candidate looks mojibake, fallback to next healthy one.
+    """
+    cleaned = []
+    for c in candidates:
+        s = _extract_exiftool_text_value(c)
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return ""
+    for s in cleaned:
+        if not _is_likely_mojibake_meta_text(s):
+            return s
+    return cleaned[0]
 
 
 def _load_macos_mdls_text(path: str, attr_name: str) -> str | None:
@@ -845,6 +987,30 @@ def load_exif_piexif(path: str) -> dict | None:
     """使用 piexif 加载 EXIF（JPEG/WebP/TIFF）。"""
     try:
         return piexif.load(path)
+    except Exception:
+        return None
+
+
+def load_exif_heic(path: str) -> dict | None:
+    """使用 pillow-heif 加载 HEIC/HEIF/HIF 的 EXIF，返回与 piexif 相同的 dict 结构；无库或失败时返回 None。"""
+    if pillow_heif is None:
+        return None
+    ext = Path(path).suffix.lower()
+    if ext not in HEIF_EXTENSIONS:
+        return None
+    try:
+        heif_file = pillow_heif.open_heif(path)
+        if not heif_file or len(heif_file) == 0:
+            return None
+        img = heif_file[0]
+        exif_bytes = None
+        if hasattr(img, "info") and isinstance(getattr(img, "info", None), dict):
+            exif_bytes = img.info.get("exif")
+        if not exif_bytes:
+            exif_bytes = getattr(img, "exif", None)
+        if not exif_bytes or not isinstance(exif_bytes, bytes):
+            return None
+        return piexif.load(exif_bytes)
     except Exception:
         return None
 
@@ -1237,8 +1403,14 @@ def _write_meta_with_piexif(path: str, meta_tag_id: str, value: str):
     else:
         raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
 
-    exif_bytes = piexif.dump(data)
-    piexif.insert(exif_bytes, path)
+    try:
+        exif_bytes = piexif.dump(data)
+        piexif.insert(exif_bytes, path)
+    except Exception as e:
+        if type(e).__name__ == "InvalidImageDataError" and _get_exiftool_executable_path():
+            _write_meta_with_exiftool(path, meta_tag_id, value)
+        else:
+            raise
 
 
 def _get_exiftool_executable_path() -> str | None:
@@ -1288,6 +1460,108 @@ def _get_exiftool_tag_target(ifd_name: str, tag_id: int) -> str | None:
     if not group:
         return raw_name
     return f"{group}:{raw_name}"
+
+
+def _build_exiftool_key_to_piexif_key() -> dict:
+    """exiftool Group:Tag -> piexif ifd:tag_id，用于排序与隐藏过滤。"""
+    out = {}
+    for ifd_name in ("0th", "Exif", "GPS", "1st", "Interop"):
+        for tag_id in piexif.TAGS.get(ifd_name, {}):
+            t = _get_exiftool_tag_target(ifd_name, tag_id)
+            if t:
+                out[t] = f"{ifd_name}:{tag_id}"
+    return out
+
+
+EXIFTOOL_KEY_TO_PIEXIF_KEY = _build_exiftool_key_to_piexif_key()
+
+# exiftool group alias -> canonical group used by _build_exiftool_key_to_piexif_key
+EXIFTOOL_GROUP_ALIASES = {
+    "IFD0": "IFD0",
+    "IFD1": "IFD1",
+    "GPS": "GPS",
+    "EXIF": "EXIF",
+    "ExifIFD": "EXIF",
+    "SubIFD": "EXIF",
+    "Interop": "InteropIFD",
+    "InteropIFD": "InteropIFD",
+}
+
+# exiftool alias keys that should map to configured piexif-style keys.
+# This keeps exif_tag_priority (e.g. Exif:40962) effective even when exiftool returns aliases.
+EXIFTOOL_ALIAS_KEY_TO_PIEXIF_KEY = {
+    "IFD0:ModifyDate": "0th:306",
+    "EXIF:ISO": "Exif:34855",
+    "ExifIFD:ISO": "Exif:34855",
+    "EXIF:ExifImageWidth": "Exif:40962",
+    "EXIF:ExifImageHeight": "Exif:40963",
+    "ExifIFD:ExifImageWidth": "Exif:40962",
+    "ExifIFD:ExifImageHeight": "Exif:40963",
+    # Keep compatibility with existing priority key 37378 in config.
+    "EXIF:ExposureCompensation": "Exif:37378",
+    "ExifIFD:ExposureCompensation": "Exif:37378",
+}
+
+
+def map_exiftool_key_to_piexif_key(exiftool_key: str | None) -> str | None:
+    """
+    Normalize exiftool Group:Tag key to piexif style key (ifd:tag_id).
+    Returns None when no reliable mapping exists.
+    """
+    if not isinstance(exiftool_key, str):
+        return None
+    key = exiftool_key.strip()
+    if not key or ":" not in key:
+        return None
+
+    mapped = EXIFTOOL_KEY_TO_PIEXIF_KEY.get(key)
+    if mapped:
+        return mapped
+
+    mapped = EXIFTOOL_ALIAS_KEY_TO_PIEXIF_KEY.get(key)
+    if mapped:
+        return mapped
+
+    group, tag_name = key.split(":", 1)
+    group_norm = EXIFTOOL_GROUP_ALIASES.get(group)
+    if not group_norm:
+        return None
+
+    mapped = EXIFTOOL_KEY_TO_PIEXIF_KEY.get(f"{group_norm}:{tag_name}")
+    if mapped:
+        return mapped
+
+    mapped = EXIFTOOL_ALIAS_KEY_TO_PIEXIF_KEY.get(f"{group_norm}:{tag_name}")
+    if mapped:
+        return mapped
+    return None
+
+
+def get_tag_name_for_exiftool_key(
+    exiftool_key: str, tag_name: str, use_chinese: bool, names_zh: dict | None = None
+) -> str:
+    """
+    根据 exiftool 的 Group:Tag 键和原始标签名，返回显示用标签名。
+    用于 exiftool 加载的行（ifd_name/tag_id 为 None）在中文/英文切换时正确显示。
+    """
+    if not use_chinese:
+        return _format_english_tag_name(tag_name) or _sanitize_display_string(tag_name)
+    if names_zh is None:
+        names_zh = load_exif_tag_names_zh_from_settings()
+    zh = names_zh.get(exiftool_key) if isinstance(names_zh, dict) else None
+    if isinstance(zh, str) and zh.strip():
+        return _sanitize_display_string(zh)
+    piexif_key = map_exiftool_key_to_piexif_key(exiftool_key)
+    if piexif_key:
+        parts = piexif_key.split(":", 1)
+        if len(parts) == 2:
+            try:
+                ifd_name, tag_id = parts[0], int(parts[1])
+                return get_tag_name(ifd_name, tag_id, use_chinese=True, names_zh=names_zh)
+            except ValueError:
+                pass
+    auto_zh = _translate_tag_name_to_chinese(tag_name)
+    return auto_zh if auto_zh else _sanitize_display_string(tag_name)
 
 
 def _normalize_rational_input(s: str) -> tuple[int, int]:
@@ -1358,26 +1632,60 @@ def _write_exif_with_exiftool(path: str, ifd_name: str, tag_id: int, new_val: st
     value = _convert_value_for_exiftool(new_val, raw_value)
     path_norm = os.path.normpath(path)
     args = ["-overwrite_original", "-charset", "filename=UTF8", f"-{tag_target}={value}", path_norm]
-    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
-    if use_argfile:
-        fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                for a in args:
-                    f.write(a + "\n")
-            cmd = [exiftool_path, "-@", argfile_path]
-            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        finally:
-            try:
-                os.unlink(argfile_path)
-            except OSError:
-                pass
-    else:
-        cmd = [exiftool_path, *args]
+    # 始终通过 UTF-8 参数文件传参，保证各平台写入 EXIF 均为 UTF-8
+    fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for a in args:
+                f.write(a + "\n")
+        cmd = [exiftool_path, "-@", argfile_path]
         cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    finally:
+        try:
+            os.unlink(argfile_path)
+        except OSError:
+            pass
     if cp.returncode != 0:
         detail = _format_process_message(cp.stdout, cp.stderr)
         raise RuntimeError(f"ExifTool 写入失败：{detail}")
+
+
+def _run_exiftool_json(path: str) -> list[dict]:
+    """用 exiftool -j -G1 读取文件元数据，返回 JSON 数组（每文件一对象）；失败返回 []。"""
+    exiftool_path = _get_exiftool_executable_path()
+    if not exiftool_path:
+        return []
+    path_norm = os.path.normpath(path)
+    args = ["-j", "-G1", path_norm]
+    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
+    try:
+        if use_argfile:
+            fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(path_norm + "\n")
+                cmd = [exiftool_path, "-charset", "filename=UTF8", "-j", "-G1", "-@", argfile_path]
+                cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            finally:
+                try:
+                    os.unlink(argfile_path)
+                except OSError:
+                    pass
+        else:
+            cmd = [exiftool_path, "-j", "-G1", path_norm]
+            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if cp.returncode != 0 or not cp.stdout.strip():
+            return []
+        out = json.loads(cp.stdout)
+        return out if isinstance(out, list) else [out] if isinstance(out, dict) else []
+    except Exception:
+        return []
+
+
+def _write_exif_with_exiftool_by_key(path: str, tag_key: str, value: str):
+    """使用 exiftool 按 Group:Tag 键写入单个标签（用于从 exiftool JSON 加载的行）。"""
+    value = _ensure_utf8_for_exiftool(_sanitize_display_string(str(value or "")))
+    _run_exiftool_assignments(path, [f"-{tag_key}={value}"])
 
 
 def _run_exiftool_assignments(path: str, assignments: list[str]):
@@ -1390,23 +1698,19 @@ def _run_exiftool_assignments(path: str, assignments: list[str]):
         )
     path_norm = os.path.normpath(path)
     args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
-    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
-    if use_argfile:
-        fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                for a in args:
-                    f.write(a + "\n")
-            cmd = [exiftool_path, "-@", argfile_path]
-            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        finally:
-            try:
-                os.unlink(argfile_path)
-            except OSError:
-                pass
-    else:
-        cmd = [exiftool_path, *args]
+    # 始终通过 UTF-8 参数文件传参，保证各平台写入 EXIF 均为 UTF-8，与路径是否含中文无关
+    fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for a in args:
+                f.write(a + "\n")
+        cmd = [exiftool_path, "-@", argfile_path]
         cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    finally:
+        try:
+            os.unlink(argfile_path)
+        except OSError:
+            pass
     if cp.returncode != 0:
         detail = _format_process_message(cp.stdout, cp.stderr)
         raise RuntimeError(f"ExifTool 写入失败：{detail}")
@@ -1575,14 +1879,14 @@ def load_about_info_from_settings() -> dict:
 
 def apply_tag_priority(rows: list[tuple], priority_keys: list[str]) -> list[tuple]:
     """
-    按配置的 tag 顺序重排 rows。
-    priority_keys 中出现的 (ifd_name, tag_id) 按顺序排在前面，
-    且这些前置字段不会在后续列表中重复显示。
+    按配置的 tag 顺序重排：先把全部 EXIF 读入列表，按 exif_tag_priority 顺序
+    在「EXIF 信息」列表前部显示设定的 tag，已显示的从列表中移除，再把剩余项追加到列表。
     """
-    if not priority_keys:
-        return rows
 
     def row_key(row):
+        if len(row) > 6 and row[6]:
+            mapped = map_exiftool_key_to_piexif_key(row[6])
+            return mapped if mapped else row[6]
         if len(row) < 2:
             return None
         ifd_name, tag_id = row[0], row[1]
@@ -1590,45 +1894,169 @@ def apply_tag_priority(rows: list[tuple], priority_keys: list[str]) -> list[tupl
             return None
         return f"{ifd_name}:{tag_id}"
 
+    def row_signature(row):
+        if len(row) < 5:
+            return None
+        name = _sanitize_display_string(str(row[3] or "")).strip().lower()
+        value = _sanitize_display_string(str(row[4] or "")).strip()
+        if not name and not value:
+            return None
+        return f"{name}\x1f{value}"
+
     normalized_priority = [k for k in priority_keys if isinstance(k, str) and k]
     if not normalized_priority:
-        return rows
+        return list(rows)
 
-    # 先取每个 key 的首个匹配行，保证前置区顺序严格按 priority_keys
-    first_row_by_key = {}
-    for row in rows:
-        key = row_key(row)
-        if key and key not in first_row_by_key:
-            first_row_by_key[key] = row
+    exif_info_list = list(rows)
+    display_list = []
+    displayed_keys = set()
 
-    front_rows = []
-    shown_priority_keys = set()
     for key in normalized_priority:
-        row = first_row_by_key.get(key)
-        if row is None or key in shown_priority_keys:
-            continue
-        front_rows.append(row)
-        shown_priority_keys.add(key)
+        # 先在 exif_info_list 找到该 key 的首个条目放入前部，
+        # 再从 exif_info_list 移除该 key 的所有条目，避免后面重复显示。
+        matched_row = None
+        remaining_rows = []
+        for row in exif_info_list:
+            if row_key(row) == key:
+                if matched_row is None:
+                    matched_row = row
+                continue
+            remaining_rows.append(row)
+        exif_info_list = remaining_rows
+        if matched_row is not None:
+            display_list.append(matched_row)
+            displayed_keys.add(key)
+            # 标题/描述在前部显示后，移除其语义重复的 exiftool 行，避免后面重复显示
+            if key == META_TITLE_PRIORITY_KEY:
+                exif_info_list = [r for r in exif_info_list if not (len(r) > 6 and r[6] in EXIFTOOL_KEYS_DUPLICATE_OF_TITLE)]
+            elif key == META_DESCRIPTION_PRIORITY_KEY:
+                exif_info_list = [r for r in exif_info_list if not (len(r) > 6 and r[6] in EXIFTOOL_KEYS_DUPLICATE_OF_DESCRIPTION)]
 
-    # 其余行保持原顺序，但跳过已前置显示的 key
-    rest_rows = []
-    for row in rows:
-        key = row_key(row)
-        if key is not None and key in shown_priority_keys:
-            continue
-        rest_rows.append(row)
+    # 再次兜底：若剩余项中仍有已在前部显示过的 key，则不再重复显示。
+    exif_info_list = [r for r in exif_info_list if row_key(r) not in displayed_keys]
 
-    return front_rows + rest_rows
+    # 再做一层明显重复项去重：同“标签名+值”只保留首次出现。
+    seen_signatures = set()
+    for row in display_list:
+        sig = row_signature(row)
+        if sig:
+            seen_signatures.add(sig)
+    for row in exif_info_list:
+        sig = row_signature(row)
+        if sig and sig in seen_signatures:
+            continue
+        if sig:
+            seen_signatures.add(sig)
+        display_list.append(row)
+    return display_list
+
+
+def load_all_exif_exiftool(path: str, tag_label_chinese: bool = False) -> list[tuple]:
+    """
+    用 exiftool -j -G1 加载 EXIF，返回 7 元组列表，第 7 项为 exiftool_key（Group:Tag）。
+    无 exiftool 或失败返回 []。
+    """
+    lst = _run_exiftool_json(path)
+    if not lst or not isinstance(lst[0], dict):
+        return []
+    obj = lst[0]
+    names_zh = load_exif_tag_names_zh_from_settings() if tag_label_chinese else None
+    hidden_keys = load_exif_tag_hidden_from_settings()
+    hidden_exiftool = set()
+    for k in hidden_keys:
+        parts = k.split(":", 1)
+        if len(parts) == 2:
+            try:
+                ifd_name, tag_id = parts[0], int(parts[1])
+                t = _get_exiftool_tag_target(ifd_name, tag_id)
+                if t:
+                    hidden_exiftool.add(t)
+            except ValueError:
+                pass
+
+    def _fmt(v):
+        return _extract_exiftool_text_value(v)
+
+    title_value = _pick_preferred_meta_text(
+        obj.get("XMP-dc:Title"),
+        obj.get("IFD0:XPTitle"),
+        obj.get("IFD0:DocumentName"),
+    )
+    desc_value = _pick_preferred_meta_text(
+        obj.get("XMP-dc:Description"),
+        obj.get("IFD0:XPComment"),
+        obj.get("IFD0:ImageDescription"),
+        obj.get("EXIF:UserComment"),
+        obj.get("ExifIFD:UserComment"),
+    )
+    desc_raw_value = _normalize_meta_edit_text(desc_value)
+    rows = []
+    rows.append(
+        (
+            META_IFD_NAME,
+            META_TITLE_TAG_ID,
+            IFD_DISPLAY_NAMES.get(META_IFD_NAME, META_IFD_NAME),
+            get_tag_name(META_IFD_NAME, META_TITLE_TAG_ID, use_chinese=tag_label_chinese, names_zh=names_zh),
+            title_value,
+            _normalize_meta_edit_text(title_value),
+            None,
+        )
+    )
+    rows.append(
+        (
+            META_IFD_NAME,
+            META_DESCRIPTION_TAG_ID,
+            IFD_DISPLAY_NAMES.get(META_IFD_NAME, META_IFD_NAME),
+            get_tag_name(META_IFD_NAME, META_DESCRIPTION_TAG_ID, use_chinese=tag_label_chinese, names_zh=names_zh),
+            desc_value,
+            desc_raw_value,
+            None,
+        )
+    )
+    rows.append(
+        (
+            CALC_IFD_NAME,
+            HYPERFOCAL_TAG_ID,
+            IFD_DISPLAY_NAMES.get(CALC_IFD_NAME, CALC_IFD_NAME),
+            get_tag_name(CALC_IFD_NAME, HYPERFOCAL_TAG_ID, use_chinese=tag_label_chinese, names_zh=names_zh),
+            _format_hyperfocal_distance(
+                _calc_hyperfocal_distance_from_exiftool_obj(
+                    obj, default_coc_mm=load_hyperfocal_coc_mm_from_settings()
+                )
+            ),
+            None,
+            None,
+        )
+    )
+    skip_keys = {"SourceFile", "File:FileName", "File:Directory", "File:FileSize", "File:FileModifyDate", "File:FileAccessDate", "File:FileCreateDate", "File:FilePermissions", "File:FileType", "File:FileTypeExtension", "File:MIMEType"}
+    skip_keys |= EXIFTOOL_KEYS_DUPLICATE_OF_TITLE | EXIFTOOL_KEYS_DUPLICATE_OF_DESCRIPTION
+    for key, value in obj.items():
+        if not isinstance(key, str) or ":" not in key or key in skip_keys:
+            continue
+        group, tag_name = key.split(":", 1)
+        if group in {"System", "ExifTool", "File"}:
+            continue
+        mapped_key = map_exiftool_key_to_piexif_key(key)
+        if key in hidden_exiftool or (mapped_key in hidden_keys if mapped_key else False):
+            continue
+        value_str = _fmt(value)
+        display_name = get_tag_name_for_exiftool_key(key, tag_name, tag_label_chinese, names_zh)
+        rows.append((None, None, group, display_name, value_str, value, key))
+    return rows
 
 
 def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
     """
-    加载全部 EXIF，返回 [(ifd_name, tag_id, 分组, 标签名, 值字符串, raw_value), ...]。
-    tag_label_chinese 为 True 时标签名使用中文（若有映射）。
+    加载全部 EXIF，返回 [(ifd_name, tag_id, 分组, 标签名, 值字符串, raw_value, exiftool_key?), ...]。
+    有 exiftool 时优先用 exiftool 读取（兼容性更好）；否则用 piexif/heic/exifread/pillow。
     """
+    if _get_exiftool_executable_path():
+        exif_rows = load_all_exif_exiftool(path, tag_label_chinese=tag_label_chinese)
+        if len(exif_rows) > 2:
+            return exif_rows
     rows = []
     names_zh = load_exif_tag_names_zh_from_settings() if tag_label_chinese else None
-    data = load_exif_piexif(path)
+    data = load_exif_piexif(path) or (load_exif_heic(path) if Path(path).suffix.lower() in HEIF_EXTENSIONS else None)
     title_value = load_display_title(path, exif_data=data)
     desc_value = load_display_description(path, exif_data=data)
     desc_raw_value = _normalize_meta_edit_text(desc_value)
@@ -1645,6 +2073,7 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
             return True
         key = re.sub(r"[\s_-]+", "", s).lower()
         return key == "imagedescription"
+    exiftool_key_for = _get_exiftool_tag_target
     rows.append(
         (
             META_IFD_NAME,
@@ -1653,6 +2082,7 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
             get_tag_name(META_IFD_NAME, META_TITLE_TAG_ID, use_chinese=tag_label_chinese, names_zh=names_zh),
             title_value,
             _normalize_meta_edit_text(title_value),
+            None,
         )
     )
     rows.append(
@@ -1663,6 +2093,7 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
             get_tag_name(META_IFD_NAME, META_DESCRIPTION_TAG_ID, use_chinese=tag_label_chinese, names_zh=names_zh),
             desc_value,
             desc_raw_value,
+            None,
         )
     )
     hidden_keys = load_exif_tag_hidden_from_settings()
@@ -1676,6 +2107,7 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
                 get_tag_name(CALC_IFD_NAME, HYPERFOCAL_TAG_ID, use_chinese=tag_label_chinese, names_zh=names_zh),
                 _format_hyperfocal_distance(hyperfocal_m),
                 None,  # 计算值，不可编辑
+                None,
             )
         )
         for ifd_name in ("0th", "Exif", "GPS", "1st", "Interop"):
@@ -1692,19 +2124,20 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
                 name = get_tag_name(ifd_name, tag_id, use_chinese=tag_label_chinese, names_zh=names_zh)
                 raw = value
                 tag_type = get_tag_type(ifd_name, tag_id)
-                rows.append((ifd_name, tag_id, group, name, format_exif_value(value, expected_type=tag_type), raw))
+                ek = exiftool_key_for(ifd_name, tag_id)
+                rows.append((ifd_name, tag_id, group, name, format_exif_value(value, expected_type=tag_type), raw, ek))
         if data.get("thumbnail"):
-            rows.append((None, None, IFD_DISPLAY_NAMES["thumbnail"], "（存在）", "是", None))
+            rows.append((None, None, IFD_DISPLAY_NAMES["thumbnail"], "（存在）", "是", None, None))
     if len(rows) <= 2 and Path(path).suffix.lower() in RAW_EXTENSIONS and exifread:
         for group, name, value in load_exif_exifread(path):
             if has_front_desc and _is_image_description_name(name):
                 continue
-            rows.append((None, None, group, name, value, None))
+            rows.append((None, None, group, name, value, None, None))
     if len(rows) <= 2:
         for group, name, value in load_exif_pillow(path):
             if has_front_desc and _is_image_description_name(name):
                 continue
-            rows.append((None, None, group, name, value, None))
+            rows.append((None, None, group, name, value, None, None))
     return rows
 
 
@@ -1785,7 +2218,7 @@ class DropZone(QLabel):
 
     def mousePressEvent(self, event):
         if event.button() == _LeftButton:
-            std_exts = " ".join(f"*{e}" for e in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"))
+            std_exts = " ".join(f"*{e}" for e in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".heic", ".heif", ".hif"))
             raw_exts = " ".join(f"*{e}" for e in RAW_EXTENSIONS)
             path, _ = QFileDialog.getOpenFileName(
                 self,
@@ -1872,6 +2305,7 @@ class ExifTable(QTableWidget):
         self.setRowCount(len(rows))
         for i, row in enumerate(rows):
             ifd_name, tag_id, group, name, value_str, raw_value = row[:6]
+            exiftool_key = row[6] if len(row) > 6 else None
             it0 = QTableWidgetItem(group)
             it0.setFlags(it0.flags() & ~_ItemIsEditable)
             self.setItem(i, 0, it0)
@@ -1889,7 +2323,8 @@ class ExifTable(QTableWidget):
                 ifd_name == META_IFD_NAME
                 and str(tag_id) in (META_TITLE_TAG_ID, META_DESCRIPTION_TAG_ID)
             )
-            editable = editable_exif or editable_meta
+            editable_exiftool_row = exiftool_key is not None and ifd_name is None and tag_id is None
+            editable = editable_exif or editable_meta or editable_exiftool_row
             if editable:
                 it2.setFlags(it2.flags() | _ItemIsEditable)
             else:
@@ -1906,6 +2341,7 @@ class ExifTable(QTableWidget):
             return
         row_data = self._filtered_rows[row]
         ifd_name, tag_id, group, name, old_val, raw_value = row_data[:6]
+        exiftool_key = row_data[6] if len(row_data) > 6 else None
         is_editable_exif = (
             isinstance(ifd_name, str)
             and ifd_name in ("0th", "Exif", "GPS", "1st", "Interop")
@@ -1916,12 +2352,13 @@ class ExifTable(QTableWidget):
             ifd_name == META_IFD_NAME
             and str(tag_id) in (META_TITLE_TAG_ID, META_DESCRIPTION_TAG_ID)
         )
-        if not (is_editable_exif or is_editable_meta):
+        is_editable_exiftool_row = exiftool_key is not None and ifd_name is None and tag_id is None
+        if not (is_editable_exif or is_editable_meta or is_editable_exiftool_row):
             return
         new_val = item.text().strip()
         if new_val == old_val:
             return
-        self._save_callback(ifd_name, tag_id, new_val, raw_value)
+        self._save_callback(ifd_name, tag_id, new_val, raw_value, exiftool_key)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -2378,13 +2815,20 @@ class MainWindow(QMainWindow):
         if not rows:
             return
         names_zh = load_exif_tag_names_zh_from_settings() if checked else None
-        new_rows = [
-            (r[0], r[1], r[2],
-             get_tag_name(r[0], r[1], use_chinese=checked, names_zh=names_zh)
-             if (r[0] is not None and r[1] is not None) else r[3],
-             r[4], r[5])
-            for r in rows
-        ]
+        new_rows = []
+        for r in rows:
+            if r[0] is not None and r[1] is not None:
+                name = get_tag_name(r[0], r[1], use_chinese=checked, names_zh=names_zh)
+            else:
+                exiftool_key = r[6] if len(r) > 6 else None
+                tag_name_raw = (exiftool_key.split(":", 1)[1] if exiftool_key and ":" in exiftool_key else None) or r[3]
+                name = (
+                    get_tag_name_for_exiftool_key(exiftool_key, tag_name_raw, checked, names_zh)
+                    if exiftool_key
+                    else r[3]
+                )
+            exiftool_key = r[6] if len(r) > 6 else None
+            new_rows.append((r[0], r[1], r[2], name, r[4], r[5], exiftool_key))
         self.exif_table.set_exif(new_rows)
 
     def _open_tag_order_config(self):
@@ -2396,13 +2840,14 @@ class MainWindow(QMainWindow):
                 rows = apply_tag_priority(rows, load_tag_priority_from_settings())
                 self.exif_table.set_exif(rows)
 
-    def _save_exif_value(self, ifd_name: str, tag_id, new_val: str, raw_value):
-        """将编辑后的 EXIF 值写回文件。"""
+    def _save_exif_value(self, ifd_name: str, tag_id, new_val: str, raw_value, exiftool_key=None):
+        """将编辑后的 EXIF 值写回文件。有 exiftool 时优先用 exiftool 写入（兼容性更好）。"""
         path = self._current_exif_path
         if not path or not os.path.isfile(path):
             QMessageBox.warning(self, "无法保存", "未选择图片或文件不存在。")
             return
         ext = Path(path).suffix.lower()
+        has_exiftool = bool(_get_exiftool_executable_path())
         try:
             if ifd_name == META_IFD_NAME and str(tag_id) in (META_TITLE_TAG_ID, META_DESCRIPTION_TAG_ID):
                 meta_tag_id = str(tag_id)
@@ -2411,37 +2856,50 @@ class MainWindow(QMainWindow):
                 if new_text == old_text:
                     QMessageBox.information(self, "未变更", "输入内容与当前值一致，未执行写入。")
                     return
-                if ext in PIEXIF_WRITABLE_EXTENSIONS:
+                if has_exiftool:
+                    _write_meta_with_exiftool(path, meta_tag_id, new_text)
+                elif ext in PIEXIF_WRITABLE_EXTENSIONS:
                     _write_meta_with_piexif(path, meta_tag_id, new_text)
                 else:
-                    _write_meta_with_exiftool(path, meta_tag_id, new_text)
-            elif ext in PIEXIF_WRITABLE_EXTENSIONS:
+                    raise RuntimeError("未找到 exiftool，无法写入该格式。请配置 exiftools_win/exiftools_mac 或将其加入 PATH。")
+            elif has_exiftool:
+                if exiftool_key:
+                    _write_exif_with_exiftool_by_key(path, exiftool_key, new_val)
+                elif ifd_name is not None and tag_id is not None:
+                    _write_exif_with_exiftool(path, ifd_name, tag_id, new_val, raw_value)
+                else:
+                    raise RuntimeError("无法写入该标签。")
+            elif ext in PIEXIF_WRITABLE_EXTENSIONS and ifd_name is not None and tag_id is not None:
                 if tag_id == 37510:
-                    # UserComment：前 8 字节为 ASCII 编码标识
                     new_raw = b"ASCII\x00\x00\x00" + new_val.encode("utf-8")
                 else:
                     new_raw = _parse_value_back(new_val, raw_value)
                 if new_raw == raw_value:
                     QMessageBox.information(self, "未变更", "输入内容解析后与原值一致，未执行写入。")
                     return
-                data = piexif.load(path)
-                if ifd_name not in data or not isinstance(data[ifd_name], dict):
-                    data[ifd_name] = {}
-                data[ifd_name][tag_id] = new_raw
-                exif_bytes = piexif.dump(data)
-                piexif.insert(exif_bytes, path)
-                # 写后回读校验，确保文件中的值确实更新
-                verify_data = piexif.load(path)
-                verify_ifd = verify_data.get(ifd_name)
-                verify_raw = verify_ifd.get(tag_id) if isinstance(verify_ifd, dict) else None
-                if verify_raw != new_raw:
-                    tag_type = get_tag_type(ifd_name, tag_id)
-                    old_fmt = format_exif_value(new_raw, expected_type=tag_type)
-                    new_fmt = format_exif_value(verify_raw, expected_type=tag_type)
-                    if old_fmt != new_fmt:
-                        raise RuntimeError("写入后校验失败：文件中的值与目标值不一致。")
+                try:
+                    data = piexif.load(path)
+                    if ifd_name not in data or not isinstance(data[ifd_name], dict):
+                        data[ifd_name] = {}
+                    data[ifd_name][tag_id] = new_raw
+                    exif_bytes = piexif.dump(data)
+                    piexif.insert(exif_bytes, path)
+                    verify_data = piexif.load(path)
+                    verify_ifd = verify_data.get(ifd_name)
+                    verify_raw = verify_ifd.get(tag_id) if isinstance(verify_ifd, dict) else None
+                    if verify_raw != new_raw:
+                        tag_type = get_tag_type(ifd_name, tag_id)
+                        old_fmt = format_exif_value(new_raw, expected_type=tag_type)
+                        new_fmt = format_exif_value(verify_raw, expected_type=tag_type)
+                        if old_fmt != new_fmt:
+                            raise RuntimeError("写入后校验失败：文件中的值与目标值不一致。")
+                except Exception as e:
+                    if type(e).__name__ == "InvalidImageDataError" and _get_exiftool_executable_path():
+                        _write_exif_with_exiftool(path, ifd_name, tag_id, new_val, raw_value)
+                    else:
+                        raise
             else:
-                _write_exif_with_exiftool(path, ifd_name, tag_id, new_val, raw_value)
+                raise RuntimeError("未找到 exiftool，无法写入该格式。请配置 exiftools_win/exiftools_mac 或将其加入 PATH。")
             rows = load_all_exif(path, tag_label_chinese=load_tag_label_chinese_from_settings())
             rows = apply_tag_priority(rows, load_tag_priority_from_settings())
             self.exif_table.set_exif(rows)
@@ -2459,7 +2917,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "无 EXIF",
-                "该图片未包含 EXIF 信息或格式暂不支持。\n支持格式：JPEG、WebP、TIFF（piexif）；各家相机 RAW（CR2/NEF/ARW/DNG 等，可选 exifread）；其他格式会尝试用 Pillow 读取。",
+                "该图片未包含 EXIF 信息或格式暂不支持。\n支持格式：JPEG、WebP、TIFF（piexif）；HEIC/HEIF/HIF（可选 pillow-heif）；各家相机 RAW（CR2/NEF/ARW/DNG 等，可选 exifread）；其他格式会尝试用 Pillow 读取。",
             )
         else:
             rows = apply_tag_priority(rows, load_tag_priority_from_settings())
