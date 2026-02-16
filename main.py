@@ -11,6 +11,7 @@ import sys
 import shutil
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from html import escape
 
@@ -1241,12 +1242,18 @@ def _write_meta_with_piexif(path: str, meta_tag_id: str, value: str):
 
 
 def _get_exiftool_executable_path() -> str | None:
-    """按平台定位 exiftool 可执行文件。"""
+    """按平台定位 exiftool 可执行文件。Windows 仅使用 .exe，不使用 .pl（避免依赖 Perl）。"""
     rel_candidates = []
     if sys.platform == "darwin":
         rel_candidates.append(os.path.join("exiftools_mac", "exiftool"))
     elif sys.platform.startswith("win"):
-        rel_candidates.append(os.path.join("exiftools_win", "exiftool.exe"))
+        # Windows 需使用独立 exe（exiftool(-k).exe），不要用 exiftool.pl
+        rel_candidates.extend([
+            os.path.join("exiftools_win", "exiftool.exe"),
+            os.path.join("exiftools_win", "exiftool(-k).exe"),
+            os.path.join("exiftools_win", "exiftool_files", "exiftool.exe"),
+            os.path.join("exiftools_win", "exiftool_files", "exiftool(-k).exe"),
+        ])
     else:
         rel_candidates.extend(
             [
@@ -1260,9 +1267,11 @@ def _get_exiftool_executable_path() -> str | None:
         if p and os.path.isfile(p):
             return p
 
-    # 兜底：系统 PATH
+    # 兜底：系统 PATH（Windows 上忽略 .pl，避免 Can't locate strict.pm）
     p = shutil.which("exiftool")
     if p and os.path.isfile(p):
+        if sys.platform.startswith("win") and p.lower().endswith(".pl"):
+            return None
         return p
     return None
 
@@ -1302,9 +1311,17 @@ def _normalize_rational_input(s: str) -> tuple[int, int]:
     return fr.numerator, fr.denominator
 
 
+def _ensure_utf8_for_exiftool(s: str) -> str:
+    """确保字符串为合法 UTF-8，避免 ExifTool 报 Malformed UTF-8（如 XPComment）。"""
+    if not s:
+        return s
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def _convert_value_for_exiftool(new_val: str, raw_value) -> str:
     """将表格编辑值转换为 exiftool 可接受的文本参数。"""
     txt = _sanitize_display_string(str(new_val or "").strip())
+    txt = _ensure_utf8_for_exiftool(txt)
     if raw_value is None:
         return txt
     if isinstance(raw_value, int):
@@ -1339,37 +1356,57 @@ def _write_exif_with_exiftool(path: str, ifd_name: str, tag_id: int, new_val: st
     if not tag_target:
         raise RuntimeError(f"不支持写入该标签：{ifd_name}:{tag_id}")
     value = _convert_value_for_exiftool(new_val, raw_value)
-    cmd = [
-        exiftool_path,
-        "-overwrite_original",
-        "-charset",
-        "filename=UTF8",
-        f"-{tag_target}={value}",
-        path,
-    ]
-    cp = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    path_norm = os.path.normpath(path)
+    args = ["-overwrite_original", "-charset", "filename=UTF8", f"-{tag_target}={value}", path_norm]
+    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
+    if use_argfile:
+        fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for a in args:
+                    f.write(a + "\n")
+            cmd = [exiftool_path, "-@", argfile_path]
+            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        finally:
+            try:
+                os.unlink(argfile_path)
+            except OSError:
+                pass
+    else:
+        cmd = [exiftool_path, *args]
+        cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if cp.returncode != 0:
         detail = _format_process_message(cp.stdout, cp.stderr)
         raise RuntimeError(f"ExifTool 写入失败：{detail}")
 
 
 def _run_exiftool_assignments(path: str, assignments: list[str]):
-    """按给定赋值参数调用 exiftool。"""
+    """按给定赋值参数调用 exiftool。Windows 下路径含非 ASCII 时通过 -@ 参数文件传 UTF-8，避免 File not found。"""
     exiftool_path = _get_exiftool_executable_path()
     if not exiftool_path:
         raise RuntimeError(
             "未找到 exiftool 可执行文件，请检查 exiftools_mac/exiftools_win 目录是否完整，"
             "或将 exiftool 加入系统 PATH。"
         )
-    cmd = [
-        exiftool_path,
-        "-overwrite_original",
-        "-charset",
-        "filename=UTF8",
-        *assignments,
-        path,
-    ]
-    cp = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    path_norm = os.path.normpath(path)
+    args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
+    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
+    if use_argfile:
+        fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for a in args:
+                    f.write(a + "\n")
+            cmd = [exiftool_path, "-@", argfile_path]
+            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        finally:
+            try:
+                os.unlink(argfile_path)
+            except OSError:
+                pass
+    else:
+        cmd = [exiftool_path, *args]
+        cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if cp.returncode != 0:
         detail = _format_process_message(cp.stdout, cp.stderr)
         raise RuntimeError(f"ExifTool 写入失败：{detail}")
@@ -1377,6 +1414,7 @@ def _run_exiftool_assignments(path: str, assignments: list[str]):
 
 def _write_meta_with_exiftool(path: str, meta_tag_id: str, value: str):
     """使用 exiftool 写入标题/描述元数据。"""
+    value = _ensure_utf8_for_exiftool(_sanitize_display_string(str(value or "")))
     if meta_tag_id == META_TITLE_TAG_ID:
         assignments = [
             f"-XMP-dc:Title={value}",

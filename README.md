@@ -3,7 +3,8 @@
 * 将图片拖入窗口即可查看全部 EXIF 信息，并支持直接双击可编辑字段值。
 * 支持自定义显示顺序，支持自定义标签名称。
 * 支持中文和英文标签名称。
-* JPEG/WebP/TIFF 写入走 `piexif`；RAW（如 ARW/CR2/NEF/DNG）写入走项目内置 `exiftools_mac` / `exiftools_win`。
+* JPEG/WebP/TIFF 写入走 `piexif`；RAW（如 ARW/CR2/NEF/DNG）写入走项目内置 `exiftools_mac` / `exiftools_win`。  
+  **Windows 用户**：需使用**独立 exe**（无需 Perl）。请从 [exiftool.org](https://exiftool.org/) 下载 Windows 版（如 `exiftool-13.xx_64.zip`），解压后将 `exiftool(-k).exe` 重命名为 `exiftool.exe` 并放入 `exiftools_win` 或 `exiftools_win/exiftool_files` 目录；不要依赖项目中的 `exiftool.pl`（需 Perl 环境，会报 `Can't locate strict.pm`）。
 * `文件信息-标题` 与 `文件信息-描述` 支持直接双击编辑并写回元数据。
 * 额外增加了超焦距计算，公式为 H = f^2 / (N * c) + f，其中 f=焦距(mm), N=光圈值, c=弥散圆(mm)。
 * 额外增加了非EXIF的标题和描述信息显示。
