@@ -9,6 +9,7 @@ a = Analysis(
         ('EXIF.cfg', '.'),
         ('image/superexif.png', 'image'),
         ('image/superexif.ico', 'image'),
+        ('image/manual/osk_banner.jpg', 'image/manual'),
         ('exiftools_win', 'exiftools_win'),
     ],
     hiddenimports=[],

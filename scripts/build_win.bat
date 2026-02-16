@@ -24,5 +24,12 @@ if errorlevel 1 goto :end
 
 echo [OK] 打包完成: dist\SuperEXIF
 
+set "SUFFIX=%~1"
+if not "%SUFFIX%"=="" (
+  set "ZIP_NAME=SuperEXIF%SUFFIX%.zip"
+  powershell -NoProfile -Command "Compress-Archive -Path 'dist\SuperEXIF' -DestinationPath 'dist\SuperEXIF%SUFFIX%.zip' -Force"
+  echo [OK] ZIP 已生成: dist\SuperEXIF%SUFFIX%.zip
+)
+
 :end
 endlocal

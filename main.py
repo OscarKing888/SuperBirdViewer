@@ -2140,7 +2140,6 @@ class MainWindow(QMainWindow):
         info = load_about_info_from_settings()
         d = QDialog(self)
         d.setWindowTitle(f"关于 {info['app_name']}")
-        d.setMinimumSize(480, 320)
         main_layout = QVBoxLayout(d)
         main_layout.setSpacing(24)
         main_layout.setContentsMargins(24, 24, 24, 24)
@@ -2184,6 +2183,23 @@ class MainWindow(QMainWindow):
         btn_row.addStretch()
         btn_row.addWidget(btn)
         main_layout.addLayout(btn_row)
+        # 底部：banner 图（缩小为一半显示）；对话框最小尺寸随其调整
+        banner_path = _get_resource_path("image/manual/osk_banner.jpg")
+        min_w, min_h = 480, 320
+        if banner_path:
+            banner_pix = QPixmap(banner_path)
+            if not banner_pix.isNull():
+                bw, bh = banner_pix.width(), banner_pix.height()
+                banner_pix = banner_pix.scaled(bw // 2, bh // 2, _KeepAspectRatio, _SmoothTransformation)
+                sw, sh = banner_pix.width(), banner_pix.height()
+                banner_label = QLabel()
+                banner_label.setPixmap(banner_pix)
+                banner_label.setAlignment(_AlignCenter)
+                banner_label.setMinimumSize(sw, sh)
+                main_layout.addWidget(banner_label, alignment=_AlignCenter)
+                min_w = max(min_w, sw + 48)
+                min_h = min_h + 24 + sh
+        d.setMinimumSize(min_w, min_h)
         d.exec()
 
     def _on_exif_filter_changed(self, text: str):
