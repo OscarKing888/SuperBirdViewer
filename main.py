@@ -13,7 +13,6 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from html import escape
 
 try:
     from PyQt6.QtWidgets import (
@@ -77,6 +76,8 @@ except ImportError:
     )
     from PyQt5.QtCore import Qt, QMimeData, QSize
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
+
+from app_common import show_about_dialog, load_about_info, AppInfoBar
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -226,14 +227,6 @@ APP_ICON_CANDIDATES = (
     os.path.join("image", "superexif.ico"),
     os.path.join("image", "superexif.icns"),
 )
-ABOUT_INFO_DEFAULT = {
-    "app_name": "SuperEXIF",
-    "version": "1.0.0",
-    "作者": "osk.ch",
-    "网站": "https://xhslink.com/m/A2cowPsYj8P",
-}
-
-
 def _get_app_dir() -> str:
     """返回当前程序目录（脚本目录或打包后可执行文件目录）。"""
     if getattr(sys, "frozen", False):
@@ -1863,20 +1856,6 @@ def load_hyperfocal_coc_mm_from_settings() -> float:
     return 0.03
 
 
-def load_about_info_from_settings() -> dict:
-    """从 EXIF.cfg 读取“关于”信息；优先保留 cfg 中的键顺序，缺失项用默认值补全。"""
-    data = _load_settings()
-    about = data.get("about", {}) if isinstance(data.get("about"), dict) else {}
-    result = {}
-    for key, value in about.items():
-        if isinstance(value, str) and value.strip():
-            result[key] = _sanitize_display_string(value)
-    for key in ABOUT_INFO_DEFAULT:
-        if key not in result:
-            result[key] = ABOUT_INFO_DEFAULT[key]
-    return result
-
-
 def apply_tag_priority(rows: list[tuple], priority_keys: list[str]) -> list[tuple]:
     """
     按配置的 tag 顺序重排：先把全部 EXIF 读入列表，按 exif_tag_priority 顺序
@@ -2629,7 +2608,7 @@ class ExifTagOrderDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        info = load_about_info_from_settings()
+        info = load_about_info(_get_config_path())
         version = info.get("version", "").strip()
         title = f"SuperEXIF - 图片 EXIF 查看与编辑器 by osk.ch"
         if version:
@@ -2658,38 +2637,13 @@ class MainWindow(QMainWindow):
 
         # App 信息区：图标 + 主副标题 + “关于...”
         app_info_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
-        app_info_widget = QWidget()
-        app_info_layout = QHBoxLayout(app_info_widget)
-        app_info_layout.setContentsMargins(0, 0, 0, 12)
-        if app_info_path:
-            icon_label = QLabel()
-            pix = QPixmap(app_info_path)
-            icon_label.setPixmap(pix.scaled(64, 64, _KeepAspectRatio, _SmoothTransformation))
-            icon_label.setFixedSize(64, 64)
-            app_info_layout.addWidget(icon_label)
-        text_col = QWidget()
-        text_layout = QVBoxLayout(text_col)
-        text_layout.setContentsMargins(8, 0, 0, 0)
-        text_layout.setSpacing(0)
-        _align_top = getattr(Qt.AlignmentFlag, "AlignTop", None) or getattr(Qt, "AlignTop", None)
-        if _align_top is not None:
-            text_layout.setAlignment(_align_top)
-        title_label = QLabel("Super EXIF")
-        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #eee; margin: 0; padding: 0;")
-        text_layout.addWidget(title_label)
-        subtitle_label = QLabel("查看与编辑EXIF")
-        subtitle_label.setStyleSheet("font-size: 12px; color: #999; margin: 0; padding: 0;")
-        text_layout.addWidget(subtitle_label)
-        about_btn = QPushButton("关于...")
-        about_btn.setFlat(True)
-        about_btn.setStyleSheet("QPushButton { color: #7eb8ed; text-align: left; padding: 0; margin: 0; min-height: 0; } QPushButton:hover { color: #9dd; }")
-        about_btn.setCursor(Qt.CursorShape.PointingHandCursor if hasattr(Qt, "CursorShape") else Qt.PointingHandCursor)
-        about_btn.clicked.connect(self._show_about_dialog)
-        text_layout.addWidget(about_btn)
-        if _align_top is not None:
-            app_info_layout.addWidget(text_col, 1, _align_top)
-        else:
-            app_info_layout.addWidget(text_col, stretch=1)
+        app_info_widget = AppInfoBar(
+            self,
+            title="Super EXIF",
+            subtitle="查看与编辑EXIF",
+            icon_path=app_info_path,
+            on_about_clicked=self._show_about_dialog,
+        )
         left_layout.addWidget(app_info_widget)
 
         self.file_label = QLabel("未选择图片")
@@ -2741,70 +2695,10 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     def _show_about_dialog(self):
-        info = load_about_info_from_settings()
-        d = QDialog(self)
-        d.setWindowTitle(f"关于 {info['app_name']}")
-        main_layout = QVBoxLayout(d)
-        main_layout.setSpacing(24)
-        main_layout.setContentsMargins(24, 24, 24, 24)
-        content = QHBoxLayout()
-        content.setSpacing(24)
-        # 左侧：LOGO
+        info = load_about_info(_get_config_path())
         logo_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
-        if logo_path:
-            pix = QPixmap(logo_path)
-            if not pix.isNull():
-                pix = pix.scaled(128, 128, _KeepAspectRatio, _SmoothTransformation)
-                logo_label = QLabel()
-                logo_label.setPixmap(pix)
-                logo_label.setAlignment(_AlignCenter)
-                content.addWidget(logo_label)
-        # 右侧：App 信息（version 之后按 cfg 顺序自适应，有几条显示几条；值为 URL 则显示为可点击链接）
-        title = f"{info.get('app_name', '')} {info.get('version', '')}".strip()
-        lines = [f"<b style='font-size:14px'>{escape(title)}</b>"]
-        for key, value in info.items():
-            if key in ("app_name", "version") or not isinstance(value, str):
-                continue
-            val = value.strip()
-            if not val:
-                continue
-            if val.lower().startswith(("http://", "https://")):
-                lines.append(f"{escape(key)}：<a href=\"{escape(val)}\">{escape(val)}</a>")
-            else:
-                lines.append(f"{escape(key)}：{escape(val)}")
-        text = "<br>".join("&nbsp;" if not line else line for line in lines)
-        info_label = QLabel(text)
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("font-size: 12px; line-height: 1.4;")
-        info_label.setTextFormat(Qt.TextFormat.RichText if hasattr(Qt, "TextFormat") else Qt.RichText)
-        info_label.setOpenExternalLinks(True)
-        content.addWidget(info_label, stretch=1)
-        main_layout.addLayout(content)
-        btn = QPushButton("确定")
-        btn.setDefault(True)
-        btn.clicked.connect(d.accept)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_row.addWidget(btn)
-        main_layout.addLayout(btn_row)
-        # 底部：banner 图（缩小为一半显示）；对话框最小尺寸随其调整
         banner_path = _get_resource_path("image/manual/osk_banner.jpg")
-        min_w, min_h = 480, 320
-        if banner_path:
-            banner_pix = QPixmap(banner_path)
-            if not banner_pix.isNull():
-                bw, bh = banner_pix.width(), banner_pix.height()
-                banner_pix = banner_pix.scaled(bw // 2, bh // 2, _KeepAspectRatio, _SmoothTransformation)
-                sw, sh = banner_pix.width(), banner_pix.height()
-                banner_label = QLabel()
-                banner_label.setPixmap(banner_pix)
-                banner_label.setAlignment(_AlignCenter)
-                banner_label.setMinimumSize(sw, sh)
-                main_layout.addWidget(banner_label, alignment=_AlignCenter)
-                min_w = max(min_w, sw + 48)
-                min_h = min_h + 24 + sh
-        d.setMinimumSize(min_w, min_h)
-        d.exec()
+        show_about_dialog(self, info, logo_path=logo_path, banner_path=banner_path)
 
     def _on_exif_filter_changed(self, text: str):
         self.exif_table.set_filter_text(text)
@@ -2925,7 +2819,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    about_info = load_about_info_from_settings()
+    about_info = load_about_info(_get_config_path())
     app_name = _sanitize_display_string(about_info.get("app_name", "SuperEXIF")) or "SuperEXIF"
     _apply_runtime_app_identity(app_name)
     app = QApplication(sys.argv)
