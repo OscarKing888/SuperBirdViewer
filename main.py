@@ -55,7 +55,7 @@ try:
     from PyQt6.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
     from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QFileSystemModel, QPainter, QBrush
 except ImportError:
-    from PyQt5.QtWidgets import (
+    from PyQt6.QtWidgets import (
         QApplication,
         QMainWindow,
         QWidget,
@@ -93,7 +93,7 @@ except ImportError:
         QStackedWidget,
         QSlider,
     )
-    from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
+    from PyQt.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush
 
 from app_common import show_about_dialog, load_about_info, AppInfoBar
@@ -336,6 +336,30 @@ def _save_settings(data: dict):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def load_last_selected_directory_from_settings() -> str | None:
+    """读取上次在目录树中选中的目录路径。"""
+    data = _load_settings()
+    raw = data.get("last_selected_directory")
+    if not isinstance(raw, str):
+        return None
+    path = raw.strip()
+    if not path:
+        return None
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        return None
+    return path
+
+
+def save_last_selected_directory_to_settings(path: str) -> None:
+    """保存目录树最后一次选中的目录路径。"""
+    if not path or not os.path.isdir(path):
+        return
+    data = _load_settings()
+    data["last_selected_directory"] = os.path.abspath(path)
+    _save_settings(data)
 
 # IFD 分组显示名称
 IFD_DISPLAY_NAMES = {
@@ -2402,7 +2426,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._file_list)
 
         # 连接目录选择 → 文件列表加载
-        self._dir_browser.directory_selected.connect(self._file_list.load_directory)
+        self._dir_browser.directory_selected.connect(self._on_directory_selected)
         # 连接文件列表选中 → 预览 + EXIF 刷新
         self._file_list.file_selected.connect(self._on_file_selected_from_list)
 
@@ -2455,14 +2479,31 @@ class MainWindow(QMainWindow):
         group_layout.addWidget(self.exif_table)
         splitter.addWidget(group)
 
-        # 各面板初始宽度：目录树 200 | 文件列表 220 | 预览 380 | EXIF 500
-        splitter.setSizes([200, 220, 380, 500])
+        # 各面板初始宽度：目录树 200 | 文件列表 320 | 预览 380 | EXIF 320
+        splitter.setSizes([200, 320, 380, 320])
         layout.addWidget(splitter)
 
         self._current_exif_path = None
 
         # preview_panel 的 parent 为 central，回调挂在 left_widget 上供拖放/选图后调用
         left_widget.on_image_loaded = self.on_image_loaded
+
+        self._restore_last_selected_directory()
+
+    def _on_directory_selected(self, path: str):
+        """目录树选中目录后，保存路径并刷新文件列表。"""
+        save_last_selected_directory_to_settings(path)
+        self._file_list.load_directory(path)
+
+    def _restore_last_selected_directory(self) -> None:
+        """启动时恢复并展开上次选中的目录。"""
+        last_dir = load_last_selected_directory_from_settings()
+        if not last_dir:
+            return
+        try:
+            self._dir_browser.select_directory(last_dir, emit_signal=True)
+        except Exception:
+            pass
 
     def _on_file_selected_from_list(self, path: str):
         """文件列表中选中图像文件，触发预览和 EXIF 加载（等同于拖放）。"""
