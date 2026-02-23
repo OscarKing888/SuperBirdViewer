@@ -45,10 +45,15 @@ try:
         QCheckBox,
         QTabWidget,
         QTreeView,
+        QTreeWidget,
+        QTreeWidgetItem,
         QSizePolicy,
+        QStyledItemDelegate,
+        QStackedWidget,
+        QSlider,
     )
-    from PyQt6.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex
-    from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QFileSystemModel
+    from PyQt6.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
+    from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QFileSystemModel, QPainter, QBrush
 except ImportError:
     from PyQt5.QtWidgets import (
         QApplication,
@@ -80,11 +85,16 @@ except ImportError:
         QCheckBox,
         QTabWidget,
         QTreeView,
+        QTreeWidget,
+        QTreeWidgetItem,
         QFileSystemModel,
         QSizePolicy,
+        QStyledItemDelegate,
+        QStackedWidget,
+        QSlider,
     )
-    from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex
-    from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
+    from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
+    from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush
 
 from app_common import show_about_dialog, load_about_info, AppInfoBar
 from app_common.exif_io import (
@@ -97,6 +107,8 @@ from app_common.exif_io import (
     _get_exiftool_tag_target,
     read_xmp_sidecar,
 )
+from app_common.file_browser import DirectoryBrowserWidget, FileListPanel
+from app_common.preview_canvas import PreviewCanvas
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -153,31 +165,6 @@ if hasattr(QMessageBox, "StandardButton"):
 else:
     _MsgOk = QMessageBox.Ok
 
-# QDir 目录过滤标志
-try:
-    _QDirDirsOnly = QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot
-except AttributeError:
-    _QDirDirsOnly = QDir.AllDirs | QDir.NoDotAndDotDot
-
-# QListView / QListWidget 视图模式
-try:
-    _ViewModeList = QListView.ViewMode.ListMode
-    _ViewModeIcon = QListView.ViewMode.IconMode
-except AttributeError:
-    _ViewModeList = QListView.ListMode
-    _ViewModeIcon = QListView.IconMode
-
-# QAbstractItemView 单选模式
-try:
-    _SingleSelection = QAbstractItemView.SelectionMode.SingleSelection
-except AttributeError:
-    _SingleSelection = QAbstractItemView.SingleSelection
-
-# QImage 颜色格式
-try:
-    _QImageRGB888 = QImage.Format.Format_RGB888
-except AttributeError:
-    _QImageRGB888 = QImage.Format_RGB888
 
 import piexif
 from PIL import Image, ImageOps
@@ -1053,6 +1040,35 @@ def load_exif_heic(path: str) -> dict | None:
         return None
 
 
+def _load_raw_full_as_pixmap(path: str) -> QPixmap | None:
+    """
+    使用 rawpy 解码 RAW 为完整原图并转为 QPixmap（应用 EXIF 方向）。
+    仅当 rawpy 可用且文件为支持的 RAW 格式时有效。
+    """
+    if rawpy is None or Path(path).suffix.lower() not in RAW_EXTENSIONS:
+        return None
+    try:
+        import numpy as np
+        with rawpy.imread(path) as rp:
+            rgb = rp.postprocess()
+        if rgb is None or rgb.size == 0:
+            return None
+        # rawpy 返回 (height, width, 3)，uint8；QImage 需要 (width, height, bpl, format)
+        h, w = rgb.shape[0], rgb.shape[1]
+        if rgb.dtype != np.uint8:
+            rgb = (rgb.astype(np.float32) * (255.0 / rgb.max())).astype(np.uint8)
+        data = rgb.copy().tobytes()
+        bpl = w * 3
+        fmt = QImage.Format.Format_RGB888 if hasattr(QImage.Format, "Format_RGB888") else QImage.Format_RGB888
+        qimg = QImage(data, w, h, bpl, fmt)
+        if qimg.isNull():
+            return None
+        pix = QPixmap.fromImage(qimg)
+        return _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
+    except Exception:
+        return None
+
+
 def get_raw_thumbnail(path: str) -> bytes | None:
     """
     从 RAW 文件中获取嵌入的 JPEG 缩略图字节，用于预览。
@@ -1889,416 +1905,60 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
     return rows
 
 
-def _load_thumbnail_image(path: str, size: int):
-    """
-    线程安全的缩略图生成，返回 QImage（不使用 QPixmap）。
-    支持普通图像格式及各家 RAW 嵌入缩略图。
-    """
-    import io as _io
-    try:
-        ext = Path(path).suffix.lower()
-        img = None
-        # RAW 文件：优先取嵌入 JPEG 缩略图
-        if ext in RAW_EXTENSIONS:
-            thumb_data = get_raw_thumbnail(path)
-            if thumb_data:
-                try:
-                    img = Image.open(_io.BytesIO(thumb_data))
-                except Exception:
-                    img = None
-        # 普通格式或 RAW 缩略图提取失败
-        if img is None:
-            try:
-                img = Image.open(path)
-            except Exception:
-                return None
-        # 应用 EXIF 方向
-        try:
-            img = ImageOps.exif_transpose(img)
-        except Exception:
-            pass
-        # 缩放为缩略图
-        img.thumbnail((size, size), Image.LANCZOS)
-        # 转换为 RGB（处理透明通道、调色板等）
-        if img.mode == "P":
-            img = img.convert("RGBA")
-        if img.mode in ("RGBA", "LA"):
-            bg = Image.new("RGB", img.size, (45, 45, 45))
-            try:
-                alpha = img.split()[-1]
-                bg.paste(img.convert("RGB"), mask=alpha)
-            except Exception:
-                bg.paste(img.convert("RGB"))
-            img = bg
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
-        # 转换为 QImage（线程安全）
-        w, h = img.size
-        data = img.tobytes("raw", "RGB")
-        qimg = QImage(data, w, h, w * 3, _QImageRGB888)
-        return qimg.copy()  # 复制以确保独立拥有数据缓冲区
-    except Exception:
-        return None
+def _load_preview_pixmap_for_canvas(path: str) -> QPixmap | None:
+    """加载预览用 QPixmap（原图，含方向修正），供 PreviewPanel 使用。"""
+    pix = _load_preview_pixmap_with_orientation(path)
+    is_raw = Path(path).suffix.lower() in RAW_EXTENSIONS
+    if (pix is None or pix.isNull()) and is_raw:
+        pix = _load_raw_full_as_pixmap(path)
+    if (pix is None or pix.isNull()) and is_raw:
+        thumb_data = get_raw_thumbnail(path)
+        if thumb_data:
+            pix = QPixmap()
+            if pix.loadFromData(thumb_data):
+                pix = _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
+                return pix
+    if pix is None or pix.isNull():
+        pix = QPixmap(path)
+    if pix is not None and not pix.isNull() and is_raw:
+        pix = _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
+    return pix
 
 
-class ThumbnailLoader(QThread):
-    """后台缩略图加载线程，逐个生成缩略图并通过信号通知主线程。"""
-
-    thumbnail_ready = pyqtSignal(str, object)  # (文件路径, QImage)
-
-    def __init__(self, paths: list, size: int, parent=None):
-        super().__init__(parent)
-        self._paths = list(paths)
-        self._size = size
-        self._stop_flag = False
-
-    def stop(self):
-        self._stop_flag = True
-        self.requestInterruption()
-
-    def run(self):
-        for path in self._paths:
-            if self._stop_flag or self.isInterruptionRequested():
-                break
-            qimg = _load_thumbnail_image(path, self._size)
-            if qimg is not None and not (self._stop_flag or self.isInterruptionRequested()):
-                self.thumbnail_ready.emit(path, qimg)
-
-
-class FileListPanel(QWidget):
-    """
-    图像文件列表面板。
-    支持列表/小缩略图/大缩略图三种显示模式，顶部有文件名过滤框。
-    """
-
-    file_selected = pyqtSignal(str)
-
-    _MODE_LIST = 0
-    _MODE_SMALL = 1
-    _MODE_LARGE = 2
+class PreviewPanel(QWidget):
+    """预览区：内嵌 app_common.preview_canvas.PreviewCanvas，提供拖放、点击选图及 set_image 等接口。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._all_files: list[str] = []
-        self._current_dir: str = ""
-        self._view_mode = self._MODE_LIST
-        self._thumbnail_loader: ThumbnailLoader | None = None
-        self._item_map: dict[str, QListWidgetItem] = {}
-        self._pending_loaders: list[ThumbnailLoader] = []
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-
-        # 过滤框
-        self._filter_edit = QLineEdit()
-        self._filter_edit.setPlaceholderText("过滤文件名…")
-        self._filter_edit.setClearButtonEnabled(True)
-        self._filter_edit.setStyleSheet("QLineEdit { padding: 4px; font-size: 12px; }")
-        self._filter_edit.textChanged.connect(self._apply_filter)
-        layout.addWidget(self._filter_edit)
-
-        # 视图模式切换按钮行
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(2)
-        mode_row.addWidget(QLabel("视图:"))
-
-        self._btn_list = QToolButton()
-        self._btn_list.setText("≡")
-        self._btn_list.setToolTip("列表视图")
-        self._btn_list.setCheckable(True)
-        self._btn_list.setChecked(True)
-        self._btn_list.setFixedWidth(28)
-        self._btn_list.clicked.connect(lambda: self._set_view_mode(self._MODE_LIST))
-
-        self._btn_small = QToolButton()
-        self._btn_small.setText("⊞")
-        self._btn_small.setToolTip("小缩略图")
-        self._btn_small.setCheckable(True)
-        self._btn_small.setFixedWidth(28)
-        self._btn_small.clicked.connect(lambda: self._set_view_mode(self._MODE_SMALL))
-
-        self._btn_large = QToolButton()
-        self._btn_large.setText("▦")
-        self._btn_large.setToolTip("大缩略图")
-        self._btn_large.setCheckable(True)
-        self._btn_large.setFixedWidth(28)
-        self._btn_large.clicked.connect(lambda: self._set_view_mode(self._MODE_LARGE))
-
-        mode_row.addWidget(self._btn_list)
-        mode_row.addWidget(self._btn_small)
-        mode_row.addWidget(self._btn_large)
-        mode_row.addStretch()
-        layout.addLayout(mode_row)
-
-        # 文件列表
-        self._list_widget = QListWidget()
-        self._list_widget.setSelectionMode(_SingleSelection)
-        self._list_widget.setUniformItemSizes(True)
-        self._list_widget.setResizeMode(QListView.ResizeMode.Adjust if hasattr(QListView, "ResizeMode") else QListView.Adjust)
-        self._list_widget.setStyleSheet("QListWidget { font-size: 12px; }")
-        self._list_widget.itemClicked.connect(self._on_item_clicked)
-        layout.addWidget(self._list_widget, stretch=1)
-
-    def load_directory(self, path: str):
-        """扫描目录，加载所有支持的图像文件。"""
-        if path == self._current_dir:
-            return
-        self._current_dir = path
-        self._stop_thumbnail_loader()
-
-        files = []
-        try:
-            for entry in sorted(os.scandir(path), key=lambda e: e.name.lower()):
-                if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS:
-                    files.append(entry.path)
-        except (PermissionError, OSError):
-            pass
-        self._all_files = files
-        self._rebuild_list()
-
-    def _rebuild_list(self):
-        """根据当前过滤文本重建文件列表。"""
-        self._stop_thumbnail_loader()
-        self._list_widget.clear()
-        self._item_map = {}
-        filter_text = self._filter_edit.text().strip().lower()
-
-        for path in self._all_files:
-            name = Path(path).name
-            if filter_text and filter_text not in name.lower():
-                continue
-            item = QListWidgetItem(name)
-            item.setData(_UserRole, path)
-            item.setToolTip(path)
-            self._item_map[path] = item
-            self._list_widget.addItem(item)
-
-        self._apply_view_style()
-        if self._view_mode != self._MODE_LIST:
-            self._start_thumbnail_loader()
-
-    def _apply_filter(self, text: str):
-        self._rebuild_list()
-
-    def _set_view_mode(self, mode: int):
-        """切换视图模式（列表/小缩略图/大缩略图）。"""
-        self._view_mode = mode
-        self._btn_list.setChecked(mode == self._MODE_LIST)
-        self._btn_small.setChecked(mode == self._MODE_SMALL)
-        self._btn_large.setChecked(mode == self._MODE_LARGE)
-        self._stop_thumbnail_loader()
-        # 清空已有图标
-        for i in range(self._list_widget.count()):
-            item = self._list_widget.item(i)
-            if item:
-                item.setIcon(QIcon())
-        self._apply_view_style()
-        if mode != self._MODE_LIST:
-            self._start_thumbnail_loader()
-
-    def _apply_view_style(self):
-        """根据视图模式调整 QListWidget 显示样式。"""
-        if self._view_mode == self._MODE_LIST:
-            self._list_widget.setViewMode(_ViewModeList)
-            self._list_widget.setIconSize(QSize(16, 16))
-            self._list_widget.setGridSize(QSize())
-            self._list_widget.setSpacing(0)
-        elif self._view_mode == self._MODE_SMALL:
-            self._list_widget.setViewMode(_ViewModeIcon)
-            self._list_widget.setIconSize(QSize(64, 64))
-            self._list_widget.setGridSize(QSize(88, 88))
-            self._list_widget.setSpacing(4)
-        else:  # _MODE_LARGE
-            self._list_widget.setViewMode(_ViewModeIcon)
-            self._list_widget.setIconSize(QSize(128, 128))
-            self._list_widget.setGridSize(QSize(148, 158))
-            self._list_widget.setSpacing(6)
-
-    def _start_thumbnail_loader(self):
-        """启动后台缩略图加载线程。"""
-        paths = []
-        for i in range(self._list_widget.count()):
-            item = self._list_widget.item(i)
-            if item:
-                p = item.data(_UserRole)
-                if p:
-                    paths.append(p)
-        if not paths:
-            return
-        size = 64 if self._view_mode == self._MODE_SMALL else 128
-        loader = ThumbnailLoader(paths, size)
-        loader.thumbnail_ready.connect(self._on_thumbnail_ready)
-        self._thumbnail_loader = loader
-        loader.start()
-
-    def _stop_thumbnail_loader(self):
-        """停止当前后台加载线程，保留引用直到其自然结束。"""
-        if self._thumbnail_loader is not None:
-            loader = self._thumbnail_loader
-            loader.stop()
-            try:
-                loader.thumbnail_ready.disconnect(self._on_thumbnail_ready)
-            except Exception:
-                pass
-            # 保持引用防止 GC，线程结束后自动清理
-            self._pending_loaders.append(loader)
-            loader.finished.connect(lambda ldr=loader: self._pending_loaders.remove(ldr)
-                                    if ldr in self._pending_loaders else None)
-            self._thumbnail_loader = None
-        # 清理已完成的旧线程引用
-        self._pending_loaders = [l for l in self._pending_loaders if l.isRunning()]
-
-    def _on_thumbnail_ready(self, path: str, qimg):
-        """后台线程返回缩略图，更新对应列表项图标。"""
-        item = self._item_map.get(path)
-        if item is None:
-            return
-        pix = QPixmap.fromImage(qimg)
-        item.setIcon(QIcon(pix))
-
-    def _on_item_clicked(self, item: QListWidgetItem):
-        """列表项被点击，发射文件选中信号。"""
-        path = item.data(_UserRole)
-        if path and os.path.isfile(path):
-            self.file_selected.emit(path)
-
-
-class DirectoryBrowserWidget(QWidget):
-    """
-    本机目录树浏览器。
-    使用 QFileSystemModel + QTreeView 展示目录结构（仅显示目录，不显示文件）。
-    """
-
-    directory_selected = pyqtSignal(str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        lbl = QLabel("  目录")
-        lbl.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px 6px 2px 6px; background: #252525;")
-        layout.addWidget(lbl)
-
-        # 文件系统模型（仅显示目录）
-        self._model = QFileSystemModel()
-        root_idx = self._model.setRootPath("")
-        self._model.setFilter(_QDirDirsOnly)
-
-        # 目录树视图
-        self._tree = QTreeView()
-        self._tree.setModel(self._model)
-        self._tree.setRootIndex(root_idx)
-        # 只显示名称列，隐藏其他列
-        for col in range(1, self._model.columnCount()):
-            self._tree.hideColumn(col)
-        self._tree.setHeaderHidden(True)
-        self._tree.setAnimated(True)
-        self._tree.setIndentation(14)
-        self._tree.setStyleSheet(
-            "QTreeView { font-size: 12px; border: none; background: #2a2a2a; }"
-            "QTreeView::item:selected { background: #3a5a8a; color: #fff; }"
-            "QTreeView::item:hover { background: #333; }"
-        )
-        self._tree.clicked.connect(self._on_clicked)
-        layout.addWidget(self._tree)
-
-        # 默认展开并定位到用户主目录
-        home = os.path.expanduser("~")
-        home_index = self._model.index(home)
-        if home_index.isValid():
-            self._tree.expand(home_index)
-            self._tree.scrollTo(home_index)
-            self._tree.setCurrentIndex(home_index)
-
-    def _on_clicked(self, index):
-        path = self._model.filePath(index)
-        if path and os.path.isdir(path):
-            self.directory_selected.emit(path)
-
-
-class DropZone(QLabel):
-    """支持拖放的图片放置区。"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAlignment(_AlignCenter)
         self.setMinimumSize(320, 240)
-        self.setFrameStyle(_FrameBox | _FrameSunken)
-        self.setStyleSheet(
-            "DropZone { background-color: #2d2d2d; border: 2px dashed #555; "
-            "border-radius: 8px; color: #888; font-size: 14px; }"
-        )
         self.setAcceptDrops(True)
         self._current_path = None
-        self._source_pixmap = None  # 原始预览图（未按控件尺寸缩放）
-        self._pixmap = None
-        self.setText("将图片拖入此处\n或点击选择文件")
-
-    def _render_scaled_preview(self):
-        """根据当前控件尺寸，从原始预览图重新高质量缩放显示。"""
-        if self._source_pixmap is None or self._source_pixmap.isNull():
-            return
-        target_w = max(1, self.size().width() - 20)
-        target_h = max(1, self.size().height() - 20)
-        self._pixmap = self._source_pixmap.scaled(
-            target_w,
-            target_h,
-            _KeepAspectRatio,
-            _SmoothTransformation,
-        )
-        self.setPixmap(self._pixmap)
-        self.setText("")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._canvas = PreviewCanvas(self, placeholder_text="将图片拖入或点击选择")
+        layout.addWidget(self._canvas, stretch=1)
 
     def set_image(self, path: str):
         self._current_path = path
-        self._source_pixmap = None
-        pix = _load_preview_pixmap_with_orientation(path)
-        is_raw = Path(path).suffix.lower() in RAW_EXTENSIONS
-        if (pix is None or pix.isNull()) and is_raw:
-            thumb_data = get_raw_thumbnail(path)
-            if thumb_data:
-                pix = QPixmap()
-                if pix.loadFromData(thumb_data):
-                    pix = _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
-                    self._source_pixmap = pix
-                    self._render_scaled_preview()
-                    return
-        if pix is None or pix.isNull():
-            pix = QPixmap(path)
+        pix = _load_preview_pixmap_for_canvas(path)
         if pix is not None and not pix.isNull():
-            if is_raw:
-                pix = _apply_orientation_to_pixmap(pix, _get_orientation_from_file(path))
-            self._source_pixmap = pix
-            self._render_scaled_preview()
+            self._canvas.set_source_pixmap(pix, reset_view=True)
         else:
-            self._source_pixmap = None
-            self._pixmap = None
-            self.setPixmap(QPixmap())
-            self.setText(f"无法预览\n{Path(path).name}")
+            self._canvas.set_source_pixmap(None)
+            self._canvas.setText(f"无法预览\n{Path(path).name}")
 
     def clear_image(self):
         self._current_path = None
-        self._source_pixmap = None
-        self._pixmap = None
-        self.setPixmap(QPixmap())
-        self.setText("将图片拖入此处\n或点击选择文件")
+        self._canvas.set_source_pixmap(None)
 
     def current_path(self):
         return self._current_path
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._source_pixmap is not None and not self._source_pixmap.isNull():
-            self._render_scaled_preview()
-
     def mousePressEvent(self, event):
         if event.button() == _LeftButton:
-            std_exts = " ".join(f"*{e}" for e in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".heic", ".heif", ".hif"))
+            std_exts = " ".join(
+                f"*{e}" for e in (".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".heic", ".heif", ".hif")
+            )
             raw_exts = " ".join(f"*{e}" for e in RAW_EXTENSIONS)
             path, _ = QFileDialog.getOpenFileName(
                 self,
@@ -2765,8 +2425,8 @@ class MainWindow(QMainWindow):
         self.file_label.setStyleSheet("color: #aaa; font-size: 12px;")
         self.file_label.setWordWrap(True)
         left_layout.addWidget(self.file_label)
-        self.drop_zone = DropZone(central)
-        left_layout.addWidget(self.drop_zone, stretch=1)
+        self.preview_panel = PreviewPanel(central)
+        left_layout.addWidget(self.preview_panel, stretch=1)
         splitter.addWidget(left_widget)
 
         # ── 面板 4：EXIF 表格 ──
@@ -2801,12 +2461,12 @@ class MainWindow(QMainWindow):
 
         self._current_exif_path = None
 
-        # drop_zone 加入 left_layout 后 parent 为 left_widget，回调需挂在 left_widget 上
+        # preview_panel 的 parent 为 central，回调挂在 left_widget 上供拖放/选图后调用
         left_widget.on_image_loaded = self.on_image_loaded
 
     def _on_file_selected_from_list(self, path: str):
         """文件列表中选中图像文件，触发预览和 EXIF 加载（等同于拖放）。"""
-        self.drop_zone.set_image(path)
+        self.preview_panel.set_image(path)
         self.on_image_loaded(path)
 
     def _init_menu_bar(self):
