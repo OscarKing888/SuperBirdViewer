@@ -78,6 +78,15 @@ except ImportError:
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon
 
 from app_common import show_about_dialog, load_about_info, AppInfoBar
+from app_common.exif_io import (
+    get_exiftool_executable_path,
+    run_exiftool_json,
+    write_exif_with_exiftool,
+    write_exif_with_exiftool_by_key,
+    write_meta_with_exiftool,
+    write_meta_with_piexif,
+    _get_exiftool_tag_target,
+)
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -1336,123 +1345,12 @@ def _apply_runtime_app_identity(app_name: str):
             pass
 
 
-def _format_process_message(stdout: str, stderr: str) -> str:
-    """合并子进程输出为单条可读消息。"""
-    out = _sanitize_display_string((stdout or "").strip())
-    err = _sanitize_display_string((stderr or "").strip())
-    if err and out:
-        return f"{err}\n{out}"
-    return err or out or "未返回详细信息。"
-
-
 def _normalize_meta_edit_text(text: str | None) -> str:
     """统一元数据编辑值，避免“（未设置）”被当成真实内容。"""
     s = _sanitize_display_string(str(text or ""))
     if s in ("（未设置）", "(未设置)", "<未设置>"):
         return ""
     return s
-
-
-def _encode_xp_text_value(text: str) -> bytes:
-    """将文本编码为 XP* 标签使用的 UTF-16LE 字节。"""
-    if not text:
-        return b""
-    return text.encode("utf-16-le") + b"\x00\x00"
-
-
-def _set_or_clear_exif_tag(ifd_data: dict, tag_id: int, value):
-    """设置或清空指定 EXIF 标签。"""
-    if not isinstance(ifd_data, dict):
-        return
-    if value is None:
-        ifd_data.pop(tag_id, None)
-    else:
-        ifd_data[tag_id] = value
-
-
-def _write_meta_with_piexif(path: str, meta_tag_id: str, value: str):
-    """使用 piexif 写入标题/描述元数据。"""
-    data = piexif.load(path)
-    ifd0 = data.get("0th")
-    if not isinstance(ifd0, dict):
-        ifd0 = {}
-        data["0th"] = ifd0
-    exif_ifd = data.get("Exif")
-    if not isinstance(exif_ifd, dict):
-        exif_ifd = {}
-        data["Exif"] = exif_ifd
-
-    if meta_tag_id == META_TITLE_TAG_ID:
-        _set_or_clear_exif_tag(ifd0, 40091, _encode_xp_text_value(value) if value else None)  # XPTitle
-        _set_or_clear_exif_tag(ifd0, 269, value.encode("utf-8") if value else None)            # DocumentName
-    elif meta_tag_id == META_DESCRIPTION_TAG_ID:
-        _set_or_clear_exif_tag(ifd0, 40092, _encode_xp_text_value(value) if value else None)   # XPComment
-        _set_or_clear_exif_tag(ifd0, 270, value.encode("utf-8") if value else None)             # ImageDescription
-        _set_or_clear_exif_tag(
-            exif_ifd,
-            37510,
-            (b"ASCII\x00\x00\x00" + value.encode("utf-8")) if value else None,                  # UserComment
-        )
-    else:
-        raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
-
-    try:
-        exif_bytes = piexif.dump(data)
-        piexif.insert(exif_bytes, path)
-    except Exception as e:
-        if type(e).__name__ == "InvalidImageDataError" and _get_exiftool_executable_path():
-            _write_meta_with_exiftool(path, meta_tag_id, value)
-        else:
-            raise
-
-
-def _get_exiftool_executable_path() -> str | None:
-    """按平台定位 exiftool 可执行文件。Windows 仅使用 .exe，不使用 .pl（避免依赖 Perl）。"""
-    rel_candidates = []
-    if sys.platform == "darwin":
-        rel_candidates.append(os.path.join("exiftools_mac", "exiftool"))
-    elif sys.platform.startswith("win"):
-        # Windows 需使用独立 exe（exiftool(-k).exe），不要用 exiftool.pl
-        rel_candidates.extend([
-            os.path.join("exiftools_win", "exiftool.exe"),
-            os.path.join("exiftools_win", "exiftool(-k).exe"),
-            os.path.join("exiftools_win", "exiftool_files", "exiftool.exe"),
-            os.path.join("exiftools_win", "exiftool_files", "exiftool(-k).exe"),
-        ])
-    else:
-        rel_candidates.extend(
-            [
-                os.path.join("exiftools_mac", "exiftool"),
-                os.path.join("exiftools_win", "exiftool.exe"),
-            ]
-        )
-
-    for rel in rel_candidates:
-        p = _get_resource_path(rel)
-        if p and os.path.isfile(p):
-            return p
-
-    # 兜底：系统 PATH（Windows 上忽略 .pl，避免 Can't locate strict.pm）
-    p = shutil.which("exiftool")
-    if p and os.path.isfile(p):
-        if sys.platform.startswith("win") and p.lower().endswith(".pl"):
-            return None
-        return p
-    return None
-
-
-def _get_exiftool_tag_target(ifd_name: str, tag_id: int) -> str | None:
-    """将 piexif 的 ifd/tag 映射为 exiftool 的 Group:Tag 形式。"""
-    info = piexif.TAGS.get(ifd_name, {}).get(tag_id)
-    if not isinstance(info, dict):
-        return None
-    raw_name = _sanitize_display_string(str(info.get("name", "")).strip())
-    if not raw_name:
-        return None
-    group = EXIFTOOL_IFD_GROUP_MAP.get(ifd_name)
-    if not group:
-        return raw_name
-    return f"{group}:{raw_name}"
 
 
 def _build_exiftool_key_to_piexif_key() -> dict:
@@ -1556,178 +1454,6 @@ def get_tag_name_for_exiftool_key(
     auto_zh = _translate_tag_name_to_chinese(tag_name)
     return auto_zh if auto_zh else _sanitize_display_string(tag_name)
 
-
-def _normalize_rational_input(s: str) -> tuple[int, int]:
-    """将用户输入解析为有理数分子/分母。"""
-    txt = str(s or "").strip()
-    if "(" in txt and ")" in txt and "/" in txt:
-        txt = txt.split("(", 1)[0].strip()
-    if "/" in txt:
-        a, _, b = txt.partition("/")
-        num = int(a.strip())
-        den = int(b.strip()) if b.strip() else 1
-        if den == 0:
-            raise ValueError("分母不能为 0。")
-        return num, den
-    f = float(txt)
-    from fractions import Fraction
-
-    fr = Fraction(f).limit_denominator(10000)
-    if fr.denominator == 0:
-        raise ValueError("分母不能为 0。")
-    return fr.numerator, fr.denominator
-
-
-def _ensure_utf8_for_exiftool(s: str) -> str:
-    """确保字符串为合法 UTF-8，避免 ExifTool 报 Malformed UTF-8（如 XPComment）。"""
-    if not s:
-        return s
-    return s.encode("utf-8", errors="replace").decode("utf-8")
-
-
-def _convert_value_for_exiftool(new_val: str, raw_value) -> str:
-    """将表格编辑值转换为 exiftool 可接受的文本参数。"""
-    txt = _sanitize_display_string(str(new_val or "").strip())
-    txt = _ensure_utf8_for_exiftool(txt)
-    if raw_value is None:
-        return txt
-    if isinstance(raw_value, int):
-        return str(int(txt))
-    if isinstance(raw_value, float):
-        return str(float(txt))
-    if isinstance(raw_value, tuple):
-        if len(raw_value) == 2 and isinstance(raw_value[0], int) and isinstance(raw_value[1], int):
-            num, den = _normalize_rational_input(txt)
-            return f"{num}/{den}"
-        b = _tuple_as_bytes(raw_value)
-        if b is not None:
-            return txt
-        if all(isinstance(x, int) for x in raw_value):
-            parts = txt.replace(",", " ").split()
-            if not parts:
-                raise ValueError("请输入整数数组。")
-            return " ".join(str(int(x)) for x in parts)
-        return txt
-    return txt
-
-
-def _write_exif_with_exiftool(path: str, ifd_name: str, tag_id: int, new_val: str, raw_value):
-    """使用 exiftool 写入单个标签。"""
-    exiftool_path = _get_exiftool_executable_path()
-    if not exiftool_path:
-        raise RuntimeError(
-            "未找到 exiftool 可执行文件，请检查 exiftools_mac/exiftools_win 目录是否完整，"
-            "或将 exiftool 加入系统 PATH。"
-        )
-    tag_target = _get_exiftool_tag_target(ifd_name, tag_id)
-    if not tag_target:
-        raise RuntimeError(f"不支持写入该标签：{ifd_name}:{tag_id}")
-    value = _convert_value_for_exiftool(new_val, raw_value)
-    path_norm = os.path.normpath(path)
-    args = ["-overwrite_original", "-charset", "filename=UTF8", f"-{tag_target}={value}", path_norm]
-    # 始终通过 UTF-8 参数文件传参，保证各平台写入 EXIF 均为 UTF-8
-    fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for a in args:
-                f.write(a + "\n")
-        cmd = [exiftool_path, "-@", argfile_path]
-        cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    finally:
-        try:
-            os.unlink(argfile_path)
-        except OSError:
-            pass
-    if cp.returncode != 0:
-        detail = _format_process_message(cp.stdout, cp.stderr)
-        raise RuntimeError(f"ExifTool 写入失败：{detail}")
-
-
-def _run_exiftool_json(path: str) -> list[dict]:
-    """用 exiftool -j -G1 读取文件元数据，返回 JSON 数组（每文件一对象）；失败返回 []。"""
-    exiftool_path = _get_exiftool_executable_path()
-    if not exiftool_path:
-        return []
-    path_norm = os.path.normpath(path)
-    args = ["-j", "-G1", path_norm]
-    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
-    try:
-        if use_argfile:
-            fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(path_norm + "\n")
-                cmd = [exiftool_path, "-charset", "filename=UTF8", "-j", "-G1", "-@", argfile_path]
-                cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            finally:
-                try:
-                    os.unlink(argfile_path)
-                except OSError:
-                    pass
-        else:
-            cmd = [exiftool_path, "-j", "-G1", path_norm]
-            cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if cp.returncode != 0 or not cp.stdout.strip():
-            return []
-        out = json.loads(cp.stdout)
-        return out if isinstance(out, list) else [out] if isinstance(out, dict) else []
-    except Exception:
-        return []
-
-
-def _write_exif_with_exiftool_by_key(path: str, tag_key: str, value: str):
-    """使用 exiftool 按 Group:Tag 键写入单个标签（用于从 exiftool JSON 加载的行）。"""
-    value = _ensure_utf8_for_exiftool(_sanitize_display_string(str(value or "")))
-    _run_exiftool_assignments(path, [f"-{tag_key}={value}"])
-
-
-def _run_exiftool_assignments(path: str, assignments: list[str]):
-    """按给定赋值参数调用 exiftool。Windows 下路径含非 ASCII 时通过 -@ 参数文件传 UTF-8，避免 File not found。"""
-    exiftool_path = _get_exiftool_executable_path()
-    if not exiftool_path:
-        raise RuntimeError(
-            "未找到 exiftool 可执行文件，请检查 exiftools_mac/exiftools_win 目录是否完整，"
-            "或将 exiftool 加入系统 PATH。"
-        )
-    path_norm = os.path.normpath(path)
-    args = ["-overwrite_original", "-charset", "filename=UTF8", *assignments, path_norm]
-    # 始终通过 UTF-8 参数文件传参，保证各平台写入 EXIF 均为 UTF-8，与路径是否含中文无关
-    fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for a in args:
-                f.write(a + "\n")
-        cmd = [exiftool_path, "-@", argfile_path]
-        cp = subprocess.run(cmd, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    finally:
-        try:
-            os.unlink(argfile_path)
-        except OSError:
-            pass
-    if cp.returncode != 0:
-        detail = _format_process_message(cp.stdout, cp.stderr)
-        raise RuntimeError(f"ExifTool 写入失败：{detail}")
-
-
-def _write_meta_with_exiftool(path: str, meta_tag_id: str, value: str):
-    """使用 exiftool 写入标题/描述元数据。"""
-    value = _ensure_utf8_for_exiftool(_sanitize_display_string(str(value or "")))
-    if meta_tag_id == META_TITLE_TAG_ID:
-        assignments = [
-            f"-XMP-dc:Title={value}",
-            f"-IFD0:XPTitle={value}",
-            f"-IFD0:DocumentName={value}",
-        ]
-    elif meta_tag_id == META_DESCRIPTION_TAG_ID:
-        assignments = [
-            f"-XMP-dc:Description={value}",
-            f"-IFD0:XPComment={value}",
-            f"-IFD0:ImageDescription={value}",
-            f"-EXIF:UserComment={value}",
-        ]
-    else:
-        raise RuntimeError(f"未知元数据标签：{meta_tag_id}")
-    _run_exiftool_assignments(path, assignments)
 
 def get_all_exif_tag_keys(use_chinese: bool = False) -> list[tuple]:
     """
@@ -1935,7 +1661,7 @@ def load_all_exif_exiftool(path: str, tag_label_chinese: bool = False) -> list[t
     用 exiftool -j -G1 加载 EXIF，返回 7 元组列表，第 7 项为 exiftool_key（Group:Tag）。
     无 exiftool 或失败返回 []。
     """
-    lst = _run_exiftool_json(path)
+    lst = run_exiftool_json(path)
     if not lst or not isinstance(lst[0], dict):
         return []
     obj = lst[0]
@@ -2029,7 +1755,7 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
     加载全部 EXIF，返回 [(ifd_name, tag_id, 分组, 标签名, 值字符串, raw_value, exiftool_key?), ...]。
     有 exiftool 时优先用 exiftool 读取（兼容性更好）；否则用 piexif/heic/exifread/pillow。
     """
-    if _get_exiftool_executable_path():
+    if get_exiftool_executable_path():
         exif_rows = load_all_exif_exiftool(path, tag_label_chinese=tag_label_chinese)
         if len(exif_rows) > 2:
             return exif_rows
@@ -2697,8 +2423,7 @@ class MainWindow(QMainWindow):
     def _show_about_dialog(self):
         info = load_about_info(_get_config_path())
         logo_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
-        banner_path = _get_resource_path("image/manual/osk_banner.jpg")
-        show_about_dialog(self, info, logo_path=logo_path, banner_path=banner_path)
+        show_about_dialog(self, info, logo_path=logo_path)
 
     def _on_exif_filter_changed(self, text: str):
         self.exif_table.set_filter_text(text)
@@ -2741,7 +2466,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法保存", "未选择图片或文件不存在。")
             return
         ext = Path(path).suffix.lower()
-        has_exiftool = bool(_get_exiftool_executable_path())
+        has_exiftool = bool(get_exiftool_executable_path())
         try:
             if ifd_name == META_IFD_NAME and str(tag_id) in (META_TITLE_TAG_ID, META_DESCRIPTION_TAG_ID):
                 meta_tag_id = str(tag_id)
@@ -2751,16 +2476,16 @@ class MainWindow(QMainWindow):
                     QMessageBox.information(self, "未变更", "输入内容与当前值一致，未执行写入。")
                     return
                 if has_exiftool:
-                    _write_meta_with_exiftool(path, meta_tag_id, new_text)
+                    write_meta_with_exiftool(path, meta_tag_id, new_text)
                 elif ext in PIEXIF_WRITABLE_EXTENSIONS:
-                    _write_meta_with_piexif(path, meta_tag_id, new_text)
+                    write_meta_with_piexif(path, meta_tag_id, new_text)
                 else:
                     raise RuntimeError("未找到 exiftool，无法写入该格式。请配置 exiftools_win/exiftools_mac 或将其加入 PATH。")
             elif has_exiftool:
                 if exiftool_key:
-                    _write_exif_with_exiftool_by_key(path, exiftool_key, new_val)
+                    write_exif_with_exiftool_by_key(path, exiftool_key, new_val)
                 elif ifd_name is not None and tag_id is not None:
-                    _write_exif_with_exiftool(path, ifd_name, tag_id, new_val, raw_value)
+                    write_exif_with_exiftool(path, ifd_name, tag_id, new_val, raw_value)
                 else:
                     raise RuntimeError("无法写入该标签。")
             elif ext in PIEXIF_WRITABLE_EXTENSIONS and ifd_name is not None and tag_id is not None:
@@ -2788,8 +2513,8 @@ class MainWindow(QMainWindow):
                         if old_fmt != new_fmt:
                             raise RuntimeError("写入后校验失败：文件中的值与目标值不一致。")
                 except Exception as e:
-                    if type(e).__name__ == "InvalidImageDataError" and _get_exiftool_executable_path():
-                        _write_exif_with_exiftool(path, ifd_name, tag_id, new_val, raw_value)
+                    if type(e).__name__ == "InvalidImageDataError" and get_exiftool_executable_path():
+                        write_exif_with_exiftool(path, ifd_name, tag_id, new_val, raw_value)
                     else:
                         raise
             else:
