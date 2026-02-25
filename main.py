@@ -108,7 +108,8 @@ from app_common.exif_io import (
     read_xmp_sidecar,
 )
 from app_common.file_browser import DirectoryBrowserWidget, FileListPanel
-from app_common.preview_canvas import PreviewCanvas
+from app_common.focus_calc import extract_focus_box, resolve_focus_camera_type_from_metadata
+from app_common.preview_canvas import PreviewCanvas, PreviewOverlayOptions, PreviewOverlayState
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -1084,7 +1085,9 @@ def _load_raw_full_as_pixmap(path: str) -> QPixmap | None:
         data = rgb.copy().tobytes()
         bpl = w * 3
         fmt = QImage.Format.Format_RGB888 if hasattr(QImage.Format, "Format_RGB888") else QImage.Format_RGB888
-        qimg = QImage(data, w, h, bpl, fmt)
+        # 这里必须立刻 deep copy：QImage(data, ...) 默认引用外部缓冲区，
+        # 在 mac/Qt 上可能出现右侧/底部黑块伪影（缓冲区生命周期/延迟转换导致）。
+        qimg = QImage(data, w, h, bpl, fmt).copy()
         if qimg.isNull():
             return None
         pix = QPixmap.fromImage(qimg)
@@ -1205,7 +1208,8 @@ def _load_preview_pixmap_with_orientation(path: str) -> QPixmap | None:
             data = img.tobytes()
         bpl = w * 3
         fmt = QImage.Format.Format_RGB888 if hasattr(QImage.Format, "Format_RGB888") else QImage.Format_RGB888
-        qimg = QImage(data, w, h, bpl, fmt)
+        # 这里必须立刻 deep copy：避免 QImage 引用 Python bytes 缓冲导致显示伪影。
+        qimg = QImage(data, w, h, bpl, fmt).copy()
         if qimg.isNull():
             return None
         return QPixmap.fromImage(qimg)
@@ -1949,6 +1953,169 @@ def _load_preview_pixmap_for_canvas(path: str) -> QPixmap | None:
     return pix
 
 
+def _load_focus_box_for_preview(path: str, width: int, height: int):
+    """
+    用 focus_calc + exiftool 元数据提取焦点框，返回归一化坐标 (l,t,r,b)。
+    无 exiftool、无匹配元数据或提取失败时返回 None。
+    """
+    if width <= 0 or height <= 0:
+        return None
+    if not get_exiftool_executable_path():
+        return None
+    try:
+        lst = run_exiftool_json(path)
+    except Exception:
+        return None
+    if not lst or not isinstance(lst[0], dict):
+        return None
+    raw_metadata = lst[0]
+    focus_width, focus_height = _resolve_focus_calc_image_size(raw_metadata, fallback=(width, height))
+    camera_type = resolve_focus_camera_type_from_metadata(raw_metadata)
+    try:
+        focus_box = extract_focus_box(
+            raw_metadata,
+            focus_width,
+            focus_height,
+            camera_type=camera_type,
+        )
+        orientation = _get_orientation_from_file(path)
+        return _transform_focus_box_by_orientation(focus_box, orientation)
+    except Exception:
+        return None
+
+
+def _resolve_focus_calc_image_size(raw_metadata: dict, fallback: tuple[int, int]) -> tuple[int, int]:
+    """
+    为 focus_calc 解析尽量接近元数据坐标系的原图尺寸。
+    优先用 exiftool 元数据里的宽高，拿不到时回退到当前预览图尺寸。
+    """
+
+    def _parse_int(value) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            iv = int(value)
+            return iv if iv > 0 else None
+        m = re.search(r"(\d+)", str(value))
+        if not m:
+            return None
+        try:
+            iv = int(m.group(1))
+            return iv if iv > 0 else None
+        except Exception:
+            return None
+
+    def _parse_pair(value) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        nums = re.findall(r"\d+", str(value))
+        if len(nums) < 2:
+            return None
+        try:
+            w = int(nums[0])
+            h = int(nums[1])
+        except Exception:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return (w, h)
+
+    lookup: dict[str, object] = {}
+    for k, v in (raw_metadata or {}).items():
+        key = str(k).strip().lower()
+        if not key:
+            continue
+        lookup.setdefault(key, v)
+        if ":" in key:
+            lookup.setdefault(key.split(":")[-1], v)
+
+    key_pairs = [
+        ("exif:exifimagewidth", "exif:exifimageheight"),
+        ("exifimagewidth", "exifimageheight"),
+        ("exif:imagewidth", "exif:imageheight"),
+        ("rawimagewidth", "rawimageheight"),
+        ("imagewidth", "imageheight"),
+        ("file:imagewidth", "file:imageheight"),
+    ]
+    for w_key, h_key in key_pairs:
+        w = _parse_int(lookup.get(w_key))
+        h = _parse_int(lookup.get(h_key))
+        if w and h:
+            return (w, h)
+
+    for pair_key in (
+        "composite:imagesize",
+        "imagesize",
+        "exif:image size",
+    ):
+        parsed = _parse_pair(lookup.get(pair_key))
+        if parsed:
+            return parsed
+
+    fw = int(fallback[0]) if fallback and len(fallback) > 0 else 0
+    fh = int(fallback[1]) if fallback and len(fallback) > 1 else 0
+    if fw > 0 and fh > 0:
+        return (fw, fh)
+    return (1, 1)
+
+
+def _transform_focus_box_by_orientation(focus_box, orientation: int):
+    """
+    将原图坐标系中的归一化焦点框按 EXIF Orientation 映射到预览坐标系。
+    预览图已做方向修正，因此焦点框也需要同步变换。
+    """
+    if not focus_box:
+        return None
+    try:
+        left, top, right, bottom = [float(v) for v in focus_box]
+    except Exception:
+        return None
+    left = max(0.0, min(1.0, left))
+    top = max(0.0, min(1.0, top))
+    right = max(0.0, min(1.0, right))
+    bottom = max(0.0, min(1.0, bottom))
+    if right < left:
+        left, right = right, left
+    if bottom < top:
+        top, bottom = bottom, top
+
+    o = int(orientation or 1)
+    if o == 1:
+        return (left, top, right, bottom)
+
+    def _map_point(x: float, y: float) -> tuple[float, float]:
+        # 采用 EXIF Orientation 的标准归一化点映射（输出坐标系为方向修正后的图像）。
+        if o == 2:
+            return (1.0 - x, y)
+        if o == 3:
+            return (1.0 - x, 1.0 - y)
+        if o == 4:
+            return (x, 1.0 - y)
+        if o == 5:
+            return (y, x)
+        if o == 6:
+            return (1.0 - y, x)
+        if o == 7:
+            return (1.0 - y, 1.0 - x)
+        if o == 8:
+            return (y, 1.0 - x)
+        return (x, y)
+
+    pts = [
+        _map_point(left, top),
+        _map_point(right, top),
+        _map_point(left, bottom),
+        _map_point(right, bottom),
+    ]
+    xs = [max(0.0, min(1.0, p[0])) for p in pts]
+    ys = [max(0.0, min(1.0, p[1])) for p in pts]
+    nl, nr = min(xs), max(xs)
+    nt, nb = min(ys), max(ys)
+    if nr - nl < 1e-6 or nb - nt < 1e-6:
+        return None
+    return (nl, nt, nr, nb)
+
+
 class PreviewPanel(QWidget):
     """预览区：内嵌 app_common.preview_canvas.PreviewCanvas，提供拖放、点击选图及 set_image 等接口。"""
 
@@ -1959,21 +2126,50 @@ class PreviewPanel(QWidget):
         self._current_path = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         self._canvas = PreviewCanvas(self, placeholder_text="将图片拖入或点击选择")
         layout.addWidget(self._canvas, stretch=1)
+        self._preview_status_label = QLabel("当前预览分辨率: -")
+        self._preview_status_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        layout.addWidget(self._preview_status_label)
 
     def set_image(self, path: str):
         self._current_path = path
+        # 切图时先清空旧焦点框，避免新图加载后短暂显示上一张图的焦点位置。
+        self.set_focus_box(None)
         pix = _load_preview_pixmap_for_canvas(path)
         if pix is not None and not pix.isNull():
             self._canvas.set_source_pixmap(pix, reset_view=True)
+            self._set_preview_status_text(pix.width(), pix.height())
         else:
             self._canvas.set_source_pixmap(None)
             self._canvas.setText(f"无法预览\n{Path(path).name}")
+            self._set_preview_status_text(None, None)
 
     def clear_image(self):
         self._current_path = None
         self._canvas.set_source_pixmap(None)
+        self._set_preview_status_text(None, None)
+
+    def set_focus_box(self, focus_box):
+        self._canvas.apply_overlay_state(PreviewOverlayState(focus_box=focus_box))
+
+    def set_show_focus_enabled(self, enabled: bool):
+        self._canvas.apply_overlay_options(
+            PreviewOverlayOptions(show_focus_box=bool(enabled))
+        )
+
+    def get_preview_image_size(self):
+        pix = getattr(self._canvas, "_source_pixmap", None)
+        if pix is None or pix.isNull():
+            return None
+        return (int(pix.width()), int(pix.height()))
+
+    def _set_preview_status_text(self, width: int | None, height: int | None) -> None:
+        if width is None or height is None:
+            self._preview_status_label.setText("当前预览分辨率: -")
+            return
+        self._preview_status_label.setText(f"当前预览分辨率: {int(width)}x{int(height)}")
 
     def current_path(self):
         return self._current_path
@@ -2449,7 +2645,12 @@ class MainWindow(QMainWindow):
         self.file_label.setStyleSheet("color: #aaa; font-size: 12px;")
         self.file_label.setWordWrap(True)
         left_layout.addWidget(self.file_label)
+        self.check_show_focus = QCheckBox("显示对焦点")
+        self.check_show_focus.setChecked(True)
+        self.check_show_focus.toggled.connect(self._on_preview_overlay_toggled)
+        left_layout.addWidget(self.check_show_focus)
         self.preview_panel = PreviewPanel(central)
+        self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
         left_layout.addWidget(self.preview_panel, stretch=1)
         splitter.addWidget(left_widget)
 
@@ -2520,6 +2721,9 @@ class MainWindow(QMainWindow):
         info = load_about_info(_get_config_path())
         logo_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
         show_about_dialog(self, info, logo_path=logo_path)
+
+    def _on_preview_overlay_toggled(self, _checked: bool) -> None:
+        self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
 
     def _on_exif_filter_changed(self, text: str):
         self.exif_table.set_filter_text(text)
@@ -2627,6 +2831,7 @@ class MainWindow(QMainWindow):
         self._current_exif_path = path
         self.file_label.setText(path)
         self.file_label.setToolTip(path)
+        self._update_preview_focus_box(path)
         rows = load_all_exif(path, tag_label_chinese=load_tag_label_chinese_from_settings())
         if not rows:
             QMessageBox.information(
@@ -2637,6 +2842,17 @@ class MainWindow(QMainWindow):
         else:
             rows = apply_tag_priority(rows, load_tag_priority_from_settings())
         self.exif_table.set_exif(rows)
+
+    def _update_preview_focus_box(self, path: str) -> None:
+        """根据当前预览图尺寸与元数据提取焦点框并更新到 PreviewCanvas。"""
+        self.preview_panel.set_focus_box(None)
+        if not path or not os.path.isfile(path):
+            return
+        size = self.preview_panel.get_preview_image_size()
+        if not size:
+            return
+        focus_box = _load_focus_box_for_preview(path, size[0], size[1])
+        self.preview_panel.set_focus_box(focus_box)
 
 
 def main():
