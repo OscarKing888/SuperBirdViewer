@@ -97,6 +97,7 @@ except ImportError:
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush
 
 from app_common import show_about_dialog, load_about_info, AppInfoBar
+from app_common.log import get_logger
 from app_common.exif_io import (
     get_exiftool_executable_path,
     run_exiftool_json,
@@ -236,6 +237,7 @@ EXIFTOOL_IFD_GROUP_MAP = {
 
 # 与主程序同目录下的配置文件
 CONFIG_FILENAME = "EXIF.cfg"
+_log = get_logger("main")
 META_IFD_NAME = "Meta"
 META_TITLE_TAG_ID = "Title"
 META_TITLE_PRIORITY_KEY = f"{META_IFD_NAME}:{META_TITLE_TAG_ID}"
@@ -1835,13 +1837,17 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
     加载全部 EXIF，返回 [(ifd_name, tag_id, 分组, 标签名, 值字符串, raw_value, exiftool_key?), ...]。
     有 exiftool 时优先用 exiftool 读取（兼容性更好）；否则用 piexif/heic/exifread/pillow。
     """
+    _log.info("[load_all_exif] EXIF 查询 path=%r", path)
     if get_exiftool_executable_path():
         exif_rows = load_all_exif_exiftool(path, tag_label_chinese=tag_label_chinese)
         if len(exif_rows) > 2:
+            _log.info("[load_all_exif] 完成 来源=exiftool path=%r 条数=%s", path, len(exif_rows))
             return exif_rows
     rows = []
     names_zh = load_exif_tag_names_zh_from_settings() if tag_label_chinese else None
     data = load_exif_piexif(path) or (load_exif_heic(path) if Path(path).suffix.lower() in HEIF_EXTENSIONS else None)
+    if data:
+        _log.info("[load_all_exif] 来源=文件内(%s) path=%r", "heic" if Path(path).suffix.lower() in HEIF_EXTENSIONS else "piexif", path)
     title_value = load_display_title(path, exif_data=data)
     desc_value = load_display_description(path, exif_data=data)
     desc_raw_value = _normalize_meta_edit_text(desc_value)
@@ -1913,23 +1919,33 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
                 rows.append((ifd_name, tag_id, group, name, format_exif_value(value, expected_type=tag_type), raw, ek))
         if data.get("thumbnail"):
             rows.append((None, None, IFD_DISPLAY_NAMES["thumbnail"], "（存在）", "是", None, None))
+    n_before = len(rows)
     if len(rows) <= 2 and Path(path).suffix.lower() in RAW_EXTENSIONS and exifread:
         for group, name, value in load_exif_exifread(path):
             if has_front_desc and _is_image_description_name(name):
                 continue
             rows.append((None, None, group, name, value, None, None))
+        if len(rows) > n_before:
+            _log.info("[load_all_exif] 补充 来源=exifread path=%r 新增条数=%s", path, len(rows) - n_before)
+    n_before = len(rows)
     if len(rows) <= 2:
         for group, name, value in load_exif_pillow(path):
             if has_front_desc and _is_image_description_name(name):
                 continue
             rows.append((None, None, group, name, value, None, None))
+        if len(rows) > n_before:
+            _log.info("[load_all_exif] 补充 来源=pillow path=%r 新增条数=%s", path, len(rows) - n_before)
     # 当 exiftool 不可用时，尝试读取 XMP sidecar 文件补充元数据
+    n_before = len(rows)
     if not get_exiftool_executable_path():
         try:
             for group, name, value in read_xmp_sidecar(path):
                 rows.append((None, None, group, name, value, None, None))
+            if len(rows) > n_before:
+                _log.info("[load_all_exif] 补充 来源=XMP_sidecar path=%r 新增条数=%s", path, len(rows) - n_before)
         except Exception:
             pass
+    _log.info("[load_all_exif] 完成 path=%r 总条数=%s", path, len(rows))
     return rows
 
 
@@ -2828,12 +2844,14 @@ class MainWindow(QMainWindow):
 
     def on_image_loaded(self, path: str):
         """图片被拖入或选择后调用。"""
+        _log.info("[on_image_loaded] 选中照片 开始查询 EXIF path=%r", path)
         self._current_exif_path = path
         self.file_label.setText(path)
         self.file_label.setToolTip(path)
         self._update_preview_focus_box(path)
         rows = load_all_exif(path, tag_label_chinese=load_tag_label_chinese_from_settings())
         if not rows:
+            _log.info("[on_image_loaded] EXIF 查询 未查到 path=%r", path)
             QMessageBox.information(
                 self,
                 "无 EXIF",
