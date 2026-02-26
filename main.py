@@ -2174,6 +2174,7 @@ class PreviewPanel(QWidget):
         self._canvas.apply_overlay_options(
             PreviewOverlayOptions(show_focus_box=bool(enabled))
         )
+        self._canvas.update()
 
     def get_preview_image_size(self):
         pix = getattr(self._canvas, "_source_pixmap", None)
@@ -2865,12 +2866,19 @@ class MainWindow(QMainWindow):
         """根据当前预览图尺寸与元数据提取焦点框并更新到 PreviewCanvas。"""
         self.preview_panel.set_focus_box(None)
         if not path or not os.path.isfile(path):
+            self._apply_show_focus_to_preview()
             return
         size = self.preview_panel.get_preview_image_size()
         if not size:
+            self._apply_show_focus_to_preview()
             return
         focus_box = _load_focus_box_for_preview(path, size[0], size[1])
         self.preview_panel.set_focus_box(focus_box)
+        self._apply_show_focus_to_preview()
+
+    def _apply_show_focus_to_preview(self) -> None:
+        """将「显示对焦点」复选框状态同步到预览 canvas，确保选项生效。"""
+        self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
 
 
 def main():
