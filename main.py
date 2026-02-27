@@ -107,6 +107,7 @@ from app_common.exif_io import (
     write_meta_with_piexif,
     _get_exiftool_tag_target,
     read_xmp_sidecar,
+    extract_metadata_with_xmp_priority,
 )
 from app_common.file_browser import DirectoryBrowserWidget, FileListPanel
 from app_common.focus_calc import extract_focus_box, resolve_focus_camera_type_from_metadata
@@ -1969,6 +1970,124 @@ def _load_preview_pixmap_for_canvas(path: str) -> QPixmap | None:
     return pix
 
 
+def _run_exiftool_json_for_focus(path: str) -> dict | None:
+    """
+    为焦点提取执行更完整的 exiftool 读取（-j -G1 -n -a -u）。
+    这样可尽量拿到数值化字段与机型私有字段（如 FocusX/SubjectArea 等）。
+    """
+    exiftool_path = get_exiftool_executable_path()
+    if not exiftool_path:
+        return None
+    path_norm = os.path.normpath(path)
+    use_argfile = sys.platform.startswith("win") and any(ord(c) > 127 for c in path_norm)
+    cmd_common = [
+        exiftool_path,
+        "-j",
+        "-G1",
+        "-n",
+        "-a",
+        "-u",
+        "-charset",
+        "filename=UTF8",
+        "-api",
+        "largefilesupport=1",
+    ]
+    try:
+        if use_argfile:
+            fd, argfile_path = tempfile.mkstemp(suffix=".args", prefix="exiftool_focus_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(path_norm + "\n")
+                cp = subprocess.run(
+                    [*cmd_common, "-@", argfile_path],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            finally:
+                try:
+                    os.unlink(argfile_path)
+                except OSError:
+                    pass
+        else:
+            cp = subprocess.run(
+                [*cmd_common, path_norm],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        if cp.returncode != 0 or not (cp.stdout or "").strip():
+            return None
+        payload = json.loads(cp.stdout)
+    except Exception:
+        return None
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                return item
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_exifread_metadata_for_focus(path: str) -> dict[str, object]:
+    """
+    针对 RAW 焦点提取的 exifread 补充读取。
+    仅抽取焦点相关与尺寸/机型关键字段，避免引入无关大块数据。
+    """
+    if exifread is None:
+        return {}
+    try:
+        with open(path, "rb") as f:
+            tags = exifread.process_file(f, details=True, extract_thumbnail=False)
+    except Exception:
+        return {}
+    if not isinstance(tags, dict) or not tags:
+        return {}
+
+    out: dict[str, object] = {}
+
+    def _tag_value(tag_obj):
+        values = getattr(tag_obj, "values", None)
+        if values not in (None, []):
+            return values
+        printable = getattr(tag_obj, "printable", None)
+        if printable not in (None, ""):
+            return printable
+        return str(tag_obj)
+
+    for key, tag in tags.items():
+        lk = str(key).strip().lower()
+        if not lk:
+            continue
+        keep = (
+            lk in {"image make", "image model", "image orientation", "exif exifimagewidth", "exif exifimagelength"}
+            or lk.startswith("makernote tag 0x2027")
+            or lk.startswith("makernote tag 0x204a")
+            or ("focus" in lk)
+            or ("subject" in lk)
+            or ("region" in lk)
+        )
+        if not keep:
+            continue
+        out[str(key)] = _tag_value(tag)
+
+    # 常用别名，方便 focus_calc 的机型与尺寸解析
+    if "Image Make" in out:
+        out.setdefault("Make", out["Image Make"])
+    if "Image Model" in out:
+        out.setdefault("Model", out["Image Model"])
+    if "EXIF ExifImageWidth" in out:
+        out.setdefault("ExifImageWidth", out["EXIF ExifImageWidth"])
+    if "EXIF ExifImageLength" in out:
+        out.setdefault("ExifImageHeight", out["EXIF ExifImageLength"])
+
+    return out
+
+
 def _load_focus_box_for_preview(path: str, width: int, height: int):
     """
     用 focus_calc + exiftool 元数据提取焦点框，返回归一化坐标 (l,t,r,b)。
@@ -1976,15 +2095,34 @@ def _load_focus_box_for_preview(path: str, width: int, height: int):
     """
     if width <= 0 or height <= 0:
         return None
-    if not get_exiftool_executable_path():
-        return None
+
+    raw_metadata = None
     try:
-        lst = run_exiftool_json(path)
+        primary = extract_metadata_with_xmp_priority(Path(path), mode="auto")
+        if isinstance(primary, dict) and primary:
+            raw_metadata = primary
     except Exception:
+        raw_metadata = None
+    if raw_metadata is None:
+        raw_metadata = _run_exiftool_json_for_focus(path)
+    if raw_metadata is None:
+        try:
+            lst = run_exiftool_json(path)
+            if lst and isinstance(lst[0], dict):
+                raw_metadata = lst[0]
+        except Exception:
+            raw_metadata = None
+    if raw_metadata is None:
+        _log.info("[_load_focus_box_for_preview] no metadata path=%r", path)
         return None
-    if not lst or not isinstance(lst[0], dict):
-        return None
-    raw_metadata = lst[0]
+
+    if Path(path).suffix.lower() in RAW_EXTENSIONS:
+        exifread_extra = _load_exifread_metadata_for_focus(path)
+        if exifread_extra:
+            merged = dict(raw_metadata)
+            merged.update(exifread_extra)
+            raw_metadata = merged
+
     focus_width, focus_height = _resolve_focus_calc_image_size(raw_metadata, fallback=(width, height))
     camera_type = resolve_focus_camera_type_from_metadata(raw_metadata)
     try:
@@ -1995,8 +2133,18 @@ def _load_focus_box_for_preview(path: str, width: int, height: int):
             camera_type=camera_type,
         )
         orientation = _get_orientation_from_file(path)
-        return _transform_focus_box_by_orientation(focus_box, orientation)
+        mapped_box = _transform_focus_box_by_orientation(focus_box, orientation)
+        _log.info(
+            "[_load_focus_box_for_preview] path=%r camera_type=%s calc_size=%sx%s focus_box=%r",
+            path,
+            str(getattr(camera_type, "value", camera_type)),
+            focus_width,
+            focus_height,
+            mapped_box,
+        )
+        return mapped_box
     except Exception:
+        _log.exception("[_load_focus_box_for_preview] failed path=%r", path)
         return None
 
 
@@ -2728,6 +2876,62 @@ class MainWindow(QMainWindow):
         self.preview_panel.set_image(path)
         self.on_image_loaded(path)
 
+    @staticmethod
+    def _find_source_file_by_stem(path: str) -> str | None:
+        """同目录同 stem 下优先查找 RAW/HEIF 源文件，供对焦点提取。"""
+        try:
+            folder = Path(path).parent
+            stem_l = Path(path).stem.lower()
+        except Exception:
+            return None
+        if not folder or not folder.is_dir() or not stem_l:
+            return None
+        preferred_exts = [".arw", ".hif", ".heif", ".heic"]
+        all_exts = preferred_exts + sorted(RAW_EXTENSIONS) + sorted(HEIF_EXTENSIONS)
+        ext_rank: dict[str, int] = {}
+        for idx, ext in enumerate(all_exts):
+            ext_l = str(ext).lower()
+            if ext_l and ext_l not in ext_rank:
+                ext_rank[ext_l] = idx
+        best_path = None
+        best_rank = 10**9
+        try:
+            for entry in os.scandir(folder):
+                if not entry.is_file():
+                    continue
+                p = Path(entry.name)
+                if p.stem.lower() != stem_l:
+                    continue
+                ext_l = p.suffix.lower()
+                if ext_l not in ext_rank:
+                    continue
+                rank = ext_rank[ext_l]
+                if rank < best_rank:
+                    best_rank = rank
+                    best_path = os.path.normpath(entry.path)
+        except Exception:
+            return None
+        return best_path
+
+    def _resolve_focus_metadata_source_path(self, path: str) -> str:
+        """
+        为“显示对焦点”解析元数据来源路径（仅源文件）：
+        1) 当前文件（若为 RAW/HEIF）
+        2) 同目录同 stem 的 RAW/HEIF 文件
+        """
+        path_norm = os.path.normpath(path) if path else ""
+        if not path_norm:
+            return ""
+
+        ext = Path(path_norm).suffix.lower()
+        if os.path.isfile(path_norm) and (ext in RAW_EXTENSIONS or ext in HEIF_EXTENSIONS):
+            return path_norm
+
+        sibling_source = self._find_source_file_by_stem(path_norm)
+        if sibling_source:
+            return sibling_source
+        return ""
+
     def _init_menu_bar(self):
         help_menu = self.menuBar().addMenu("帮助")
         about_action = QAction("关于...", self)
@@ -2872,7 +3076,13 @@ class MainWindow(QMainWindow):
         if not size:
             self._apply_show_focus_to_preview()
             return
-        focus_box = _load_focus_box_for_preview(path, size[0], size[1])
+        focus_source_path = self._resolve_focus_metadata_source_path(path)
+        if not focus_source_path or not os.path.isfile(focus_source_path):
+            _log.info("[_update_preview_focus_box] skip: no source file for focus preview=%r", path)
+            self._apply_show_focus_to_preview()
+            return
+        _log.info("[_update_preview_focus_box] preview=%r focus_source=%r", path, focus_source_path)
+        focus_box = _load_focus_box_for_preview(focus_source_path, size[0], size[1])
         self.preview_panel.set_focus_box(focus_box)
         self._apply_show_focus_to_preview()
 
