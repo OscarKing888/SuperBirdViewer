@@ -2873,7 +2873,9 @@ class MainWindow(QMainWindow):
 
     def _on_file_selected_from_list(self, path: str):
         """文件列表中选中图像文件，触发预览和 EXIF 加载（等同于拖放）。"""
-        self.preview_panel.set_image(path)
+        preview_path = self._file_list.resolve_preview_path(path)
+        _log.info("[_on_file_selected_from_list] source=%r preview=%r", path, preview_path)
+        self.preview_panel.set_image(preview_path)
         self.on_image_loaded(path)
 
     @staticmethod
