@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SuperEXIF - 图片 EXIF 信息查看器
+Super Viewer - 图片 EXIF等元信息查看器
 支持拖拽图片到窗口，使用 piexif 读取并展示全部 EXIF 数据。
 """
 
@@ -2198,6 +2198,56 @@ def _load_focus_box_for_preview(path: str, width: int, height: int):
         return None
 
 
+class FocusBoxLoader(QThread):
+    focus_loaded = pyqtSignal(int, object, str)  # (request_id, focus_box_or_none, used_path)
+
+    def __init__(self, request_id: int, preview_path: str, source_path: str, width: int, height: int, parent=None):
+        super().__init__(parent)
+        self._request_id = int(request_id)
+        self._preview_path = os.path.normpath(preview_path) if preview_path else ""
+        self._source_path = os.path.normpath(source_path) if source_path else ""
+        self._width = int(width)
+        self._height = int(height)
+
+    def run(self) -> None:
+        candidates: list[tuple[str, str]] = []
+        if self._preview_path and os.path.isfile(self._preview_path):
+            candidates.append(("preview", self._preview_path))
+        if self._source_path and os.path.isfile(self._source_path):
+            same_as_preview = (
+                self._preview_path
+                and os.path.normcase(self._preview_path) == os.path.normcase(self._source_path)
+            )
+            if not same_as_preview:
+                candidates.append(("source", self._source_path))
+
+        _log.info(
+            "[FocusBoxLoader.run] START request_id=%s preview=%r source=%r candidates=%s",
+            self._request_id,
+            self._preview_path,
+            self._source_path,
+            [(label, path) for label, path in candidates],
+        )
+        for label, candidate_path in candidates:
+            if self.isInterruptionRequested():
+                _log.info("[FocusBoxLoader.run] interrupted request_id=%s", self._request_id)
+                return
+            focus_box = _load_focus_box_for_preview(candidate_path, self._width, self._height)
+            _log.info(
+                "[FocusBoxLoader.run] tried request_id=%s label=%s path=%r focus_box=%r",
+                self._request_id,
+                label,
+                candidate_path,
+                focus_box,
+            )
+            if focus_box:
+                self.focus_loaded.emit(self._request_id, focus_box, candidate_path)
+                return
+
+        fallback_used_path = self._source_path or self._preview_path
+        self.focus_loaded.emit(self._request_id, None, fallback_used_path)
+
+
 def _resolve_focus_calc_image_size(raw_metadata: dict, fallback: tuple[int, int]) -> tuple[int, int]:
     """
     为 focus_calc 解析尽量接近元数据坐标系的原图尺寸。
@@ -2900,6 +2950,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
 
         self._current_exif_path = None
+        self._focus_loader: FocusBoxLoader | None = None
+        self._focus_request_id: int = 0
 
         # preview_panel 的 parent 为 central，回调挂在 left_widget 上供拖放/选图后调用
         left_widget.on_image_loaded = self.on_image_loaded
@@ -3130,19 +3182,72 @@ class MainWindow(QMainWindow):
         """根据当前预览图尺寸与元数据提取焦点框并更新到 PreviewCanvas。"""
         self.preview_panel.set_focus_box(None)
         if not path or not os.path.isfile(path):
+            self._stop_focus_loader()
             self._apply_show_focus_to_preview()
             return
         size = self.preview_panel.get_preview_image_size()
         if not size:
+            self._stop_focus_loader()
             self._apply_show_focus_to_preview()
             return
+        preview_path = self.preview_panel.current_path() or path
         focus_source_path = self._resolve_focus_metadata_source_path(path)
-        if not focus_source_path or not os.path.isfile(focus_source_path):
-            _log.info("[_update_preview_focus_box] skip: no source file for focus preview=%r", path)
+        if (not preview_path or not os.path.isfile(preview_path)) and (not focus_source_path or not os.path.isfile(focus_source_path)):
+            self._stop_focus_loader()
+            _log.info("[_update_preview_focus_box] skip: no usable path preview=%r focus_source=%r", preview_path, focus_source_path)
             self._apply_show_focus_to_preview()
             return
-        _log.info("[_update_preview_focus_box] preview=%r focus_source=%r", path, focus_source_path)
-        focus_box = _load_focus_box_for_preview(focus_source_path, size[0], size[1])
+        self._stop_focus_loader()
+        self._focus_request_id += 1
+        request_id = self._focus_request_id
+        _log.info(
+            "[_update_preview_focus_box] async request_id=%s preview=%r focus_source=%r size=%sx%s",
+            request_id,
+            preview_path,
+            focus_source_path,
+            size[0],
+            size[1],
+        )
+        loader = FocusBoxLoader(request_id, preview_path, focus_source_path, size[0], size[1], self)
+        loader.focus_loaded.connect(self._on_focus_box_loaded)
+        self._focus_loader = loader
+        loader.start()
+        self._apply_show_focus_to_preview()
+
+    def _stop_focus_loader(self) -> None:
+        loader = self._focus_loader
+        if loader is None:
+            return
+        try:
+            loader.focus_loaded.disconnect(self._on_focus_box_loaded)
+        except Exception:
+            pass
+        loader.requestInterruption()
+        self._focus_loader = None
+
+    def _on_focus_box_loaded(self, request_id: int, focus_box, used_path: str) -> None:
+        if request_id != self._focus_request_id:
+            _log.info(
+                "[_on_focus_box_loaded] ignore stale request_id=%s current=%s used_path=%r",
+                request_id,
+                self._focus_request_id,
+                used_path,
+            )
+            return
+        loader = self.sender()
+        if isinstance(loader, FocusBoxLoader):
+            try:
+                loader.focus_loaded.disconnect(self._on_focus_box_loaded)
+            except Exception:
+                pass
+            if self._focus_loader is loader:
+                self._focus_loader = None
+        _log.info(
+            "[_on_focus_box_loaded] request_id=%s used_path=%r focus_box=%r",
+            request_id,
+            used_path,
+            focus_box,
+        )
         self.preview_panel.set_focus_box(focus_box)
         self._apply_show_focus_to_preview()
 
