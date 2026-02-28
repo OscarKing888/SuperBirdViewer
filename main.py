@@ -112,6 +112,7 @@ from app_common.exif_io import (
 from app_common.file_browser import DirectoryBrowserWidget, FileListPanel
 from app_common.focus_calc import extract_focus_box, resolve_focus_camera_type_from_metadata
 from app_common.preview_canvas import PreviewCanvas, PreviewOverlayOptions, PreviewOverlayState
+from app_common.report_db import PHOTO_COLUMNS
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -1950,6 +1951,55 @@ def load_all_exif(path: str, tag_label_chinese: bool = False) -> list[tuple]:
     return rows
 
 
+def _format_report_metadata_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def _is_title_like_row(row: tuple) -> bool:
+    if len(row) > 6 and row[6] in EXIFTOOL_KEYS_DUPLICATE_OF_TITLE:
+        return True
+    if len(row) >= 2 and row[0] == META_IFD_NAME and str(row[1]) == META_TITLE_TAG_ID:
+        return True
+    return False
+
+
+def build_report_metadata_rows(report_row: dict | None) -> list[tuple]:
+    if not isinstance(report_row, dict):
+        return []
+
+    rows: list[tuple] = []
+    ordered_names = ["bird_species_cn", "bird_species_en"] + [
+        name for name, _sql, _default in PHOTO_COLUMNS
+        if name not in {"bird_species_cn", "bird_species_en"}
+    ]
+    name_map = {
+        "bird_species_cn": "标题",
+        "bird_species_en": "标题Eng",
+        "title": "标题Raw",
+    }
+    for col_name in ordered_names:
+        display_name = name_map.get(col_name, col_name)
+        value_str = _format_report_metadata_value(report_row.get(col_name))
+        rows.append((None, None, "ReportDB", display_name, value_str, report_row.get(col_name), None))
+    return rows
+
+
+def merge_report_metadata_rows(rows: list[tuple], report_row: dict | None) -> list[tuple]:
+    if not isinstance(report_row, dict):
+        return list(rows)
+    merged_rows = list(rows)
+    species_title = str(report_row.get("bird_species_cn") or "").strip()
+    if species_title:
+        merged_rows = [row for row in merged_rows if not _is_title_like_row(row)]
+    return build_report_metadata_rows(report_row) + merged_rows
+
+
 def _load_preview_pixmap_for_canvas(path: str) -> QPixmap | None:
     """加载预览用 QPixmap（原图，含方向修正），供 PreviewPanel 使用。"""
     pix = _load_preview_pixmap_with_orientation(path)
@@ -2820,7 +2870,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(left_widget)
 
         # ── 面板 4：EXIF 表格 ──
-        group = QGroupBox("EXIF 信息")
+        group = QGroupBox("元信息")
         group.setStyleSheet("QGroupBox { font-weight: bold; }")
         group_layout = QVBoxLayout(group)
         top_row = QHBoxLayout()
@@ -2855,6 +2905,18 @@ class MainWindow(QMainWindow):
         left_widget.on_image_loaded = self.on_image_loaded
 
         self._restore_last_selected_directory()
+
+    def _get_report_row_for_current_path(self, path: str) -> dict | None:
+        try:
+            return self._file_list.get_report_row_for_path(path)
+        except Exception:
+            return None
+
+    def _load_metadata_rows_for_current_path(self, path: str, tag_label_chinese: bool) -> list[tuple]:
+        rows = load_all_exif(path, tag_label_chinese=tag_label_chinese)
+        rows = apply_tag_priority(rows, load_tag_priority_from_settings())
+        rows = merge_report_metadata_rows(rows, self._get_report_row_for_current_path(path))
+        return rows
 
     def _on_directory_selected(self, path: str):
         """目录树选中目录后，保存路径并刷新文件列表。"""
@@ -2978,8 +3040,7 @@ class MainWindow(QMainWindow):
         d = ExifTagOrderDialog(self, use_chinese=use_chinese)
         if d.exec():
             if self._current_exif_path and os.path.isfile(self._current_exif_path):
-                rows = load_all_exif(self._current_exif_path, tag_label_chinese=use_chinese)
-                rows = apply_tag_priority(rows, load_tag_priority_from_settings())
+                rows = self._load_metadata_rows_for_current_path(self._current_exif_path, tag_label_chinese=use_chinese)
                 self.exif_table.set_exif(rows)
 
     def _save_exif_value(self, ifd_name: str, tag_id, new_val: str, raw_value, exiftool_key=None):
@@ -3042,8 +3103,7 @@ class MainWindow(QMainWindow):
                         raise
             else:
                 raise RuntimeError("未找到 exiftool，无法写入该格式。请配置 exiftools_win/exiftools_mac 或将其加入 PATH。")
-            rows = load_all_exif(path, tag_label_chinese=load_tag_label_chinese_from_settings())
-            rows = apply_tag_priority(rows, load_tag_priority_from_settings())
+            rows = self._load_metadata_rows_for_current_path(path, tag_label_chinese=load_tag_label_chinese_from_settings())
             self.exif_table.set_exif(rows)
             QMessageBox.information(self, "已保存", "EXIF 已写入文件。")
         except Exception as e:
@@ -3056,7 +3116,7 @@ class MainWindow(QMainWindow):
         self.file_label.setText(path)
         self.file_label.setToolTip(path)
         self._update_preview_focus_box(path)
-        rows = load_all_exif(path, tag_label_chinese=load_tag_label_chinese_from_settings())
+        rows = self._load_metadata_rows_for_current_path(path, tag_label_chinese=load_tag_label_chinese_from_settings())
         if not rows:
             _log.info("[on_image_loaded] EXIF 查询 未查到 path=%r", path)
             QMessageBox.information(
@@ -3064,8 +3124,6 @@ class MainWindow(QMainWindow):
                 "无 EXIF",
                 "该图片未包含 EXIF 信息或格式暂不支持。\n支持格式：JPEG、WebP、TIFF（piexif）；HEIC/HEIF/HIF（可选 pillow-heif）；各家相机 RAW（CR2/NEF/ARW/DNG 等，可选 exifread）；其他格式会尝试用 Pillow 读取。",
             )
-        else:
-            rows = apply_tag_priority(rows, load_tag_priority_from_settings())
         self.exif_table.set_exif(rows)
 
     def _update_preview_focus_box(self, path: str) -> None:
