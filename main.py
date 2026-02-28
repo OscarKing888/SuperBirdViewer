@@ -1335,6 +1335,34 @@ def _build_windows_app_id(app_name: str) -> str:
     return f"oskch.{base}"
 
 
+def _get_product_display_name(about_info: dict | None = None) -> str:
+    """Return the short product name used for window/app titles."""
+    raw_name = ""
+    if isinstance(about_info, dict):
+        raw_name = _sanitize_display_string(about_info.get("app_name", "")) or ""
+    if not raw_name:
+        raw_name = "Super Viewer"
+    short_name = raw_name.split(" - ", 1)[0].strip()
+    return short_name or "Super Viewer"
+
+
+def _build_main_window_title(about_info: dict | None = None) -> str:
+    """Build the visible main window title from about config fields."""
+    if not isinstance(about_info, dict):
+        return "Super Viewer"
+
+    app_name = _sanitize_display_string(about_info.get("app_name", "")) or "Super Viewer"
+    version = _sanitize_display_string(about_info.get("version", "")) or ""
+    author = _sanitize_display_string(about_info.get("作者", "")) or ""
+
+    parts: list[str] = [app_name]
+    if version:
+        parts.append(version)
+    if author:
+        parts.append(author)
+    return " - ".join(parts)
+
+
 def _set_macos_process_name_via_objc(name: str) -> bool:
     """
     使用 Objective-C runtime 直接设置 macOS 进程名。
@@ -3088,11 +3116,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         info = load_about_info(_get_config_path())
-        version = info.get("version", "").strip()
-        title = f"Super Viewer - 图片 EXIF 查看与编辑器 by osk.ch"
-        if version:
-            title = f"Super Viewer {version} - 图片 EXIF 查看与编辑器 by osk.ch"
-        self.setWindowTitle(title)
+        product_name = _get_product_display_name(info)
+        self.setWindowTitle(_build_main_window_title(info))
         self.setMinimumSize(900, 600)
         self.resize(1500, 960)
         self._init_menu_bar()
@@ -3132,7 +3157,7 @@ class MainWindow(QMainWindow):
         app_info_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
         app_info_widget = AppInfoBar(
             self,
-            title="Super Viewer",
+            title=product_name,
             subtitle="查看与编辑EXIF",
             icon_path=app_info_path,
             on_about_clicked=self._show_about_dialog,
@@ -3491,7 +3516,7 @@ class MainWindow(QMainWindow):
 
 def main():
     about_info = load_about_info(_get_config_path())
-    app_name = _sanitize_display_string(about_info.get("app_name", "Super Viewer")) or "Super Viewer"
+    app_name = _get_product_display_name(about_info)
     _apply_runtime_app_identity(app_name)
     app = QApplication(sys.argv)
     if hasattr(app, "setApplicationName"):
