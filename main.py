@@ -112,7 +112,7 @@ from app_common.exif_io import (
 from app_common.file_browser import DirectoryBrowserWidget, FileListPanel
 from app_common.focus_calc import extract_focus_box, resolve_focus_camera_type_from_metadata
 from app_common.preview_canvas import PreviewCanvas, PreviewOverlayOptions, PreviewOverlayState
-from app_common.report_db import PHOTO_COLUMNS
+from app_common.report_db import PHOTO_COLUMNS, find_report_root, ReportDB
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -2138,40 +2138,215 @@ def _load_exifread_metadata_for_focus(path: str) -> dict[str, object]:
     return out
 
 
-def _load_focus_box_for_preview(path: str, width: int, height: int):
+def _focus_metadata_value_present(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) > 0
+    return True
+
+
+def _merge_focus_metadata_parts(parts: list[tuple[str, dict | None]]) -> tuple[dict | None, list[str]]:
+    merged: dict[str, object] = {}
+    used_providers: list[str] = []
+    for label, part in parts:
+        if not isinstance(part, dict) or not part:
+            continue
+        used_providers.append(f"{label}:{len(part)}")
+        for key, value in part.items():
+            key_text = str(key).strip()
+            if not key_text or not _focus_metadata_value_present(value):
+                continue
+            if key_text not in merged or not _focus_metadata_value_present(merged.get(key_text)):
+                merged[key_text] = value
+    return (merged or None), used_providers
+
+
+def _load_heif_piexif_metadata_for_focus(path: str) -> dict[str, object]:
+    data = load_exif_heic(path)
+    if not isinstance(data, dict) or not data:
+        return {}
+
+    out: dict[str, object] = {"SourceFile": path}
+    for ifd_name, ifd_data in data.items():
+        if not isinstance(ifd_data, dict):
+            continue
+        tag_defs = piexif.TAGS.get(ifd_name, {})
+        for tag_id, raw_value in ifd_data.items():
+            info = tag_defs.get(tag_id)
+            if not isinstance(info, dict):
+                continue
+            tag_name = str(info.get("name") or "").strip()
+            if not tag_name:
+                continue
+            out[f"{ifd_name}:{tag_name}"] = raw_value
+
+            if tag_name == "Make":
+                out.setdefault("Make", raw_value)
+            elif tag_name == "Model":
+                out.setdefault("Model", raw_value)
+            elif tag_name == "Orientation":
+                out.setdefault("Orientation", raw_value)
+            elif tag_name == "ExifImageWidth":
+                out.setdefault("ExifImageWidth", raw_value)
+            elif tag_name == "ExifImageLength":
+                out.setdefault("ExifImageHeight", raw_value)
+            elif tag_name == "ImageWidth":
+                out.setdefault("ImageWidth", raw_value)
+            elif tag_name == "ImageLength":
+                out.setdefault("ImageHeight", raw_value)
+
+    return out
+
+
+def _load_focus_metadata_for_path(path: str) -> dict | None:
+    path_text = str(path or "").strip()
+    if not path_text:
+        return None
+
+    ext = Path(path_text).suffix.lower()
+    primary = None
+    try:
+        primary = extract_metadata_with_xmp_priority(Path(path_text), mode="auto")
+    except Exception:
+        primary = None
+
+    if ext in RAW_EXTENSIONS:
+        parts = [
+            ("exiftool", _run_exiftool_json_for_focus(path_text)),
+            ("primary", primary if isinstance(primary, dict) else None),
+            ("exifread", _load_exifread_metadata_for_focus(path_text)),
+        ]
+    elif ext in HEIF_EXTENSIONS:
+        parts = [
+            ("exiftool", _run_exiftool_json_for_focus(path_text)),
+            ("heif_piexif", _load_heif_piexif_metadata_for_focus(path_text)),
+            ("primary", primary if isinstance(primary, dict) else None),
+            ("exifread", _load_exifread_metadata_for_focus(path_text)),
+        ]
+    else:
+        parts = [
+            ("exiftool", _run_exiftool_json_for_focus(path_text)),
+            ("primary", primary if isinstance(primary, dict) else None),
+        ]
+
+    merged, providers = _merge_focus_metadata_parts(parts)
+    _log.info(
+        "[_load_focus_metadata_for_path] path=%r ext=%r providers=%s merged_keys=%s",
+        path_text,
+        ext,
+        providers or ["none"],
+        len(merged or {}),
+    )
+    return merged
+
+
+def _focus_box_from_center_and_span(
+    center_x: float, center_y: float, span_x: float, span_y: float
+) -> tuple[float, float, float, float]:
+    """由归一化中心与宽高比得到 (l,t,r,b)，并 clamp 到 [0,1]。"""
+    cx = max(0.0, min(1.0, center_x))
+    cy = max(0.0, min(1.0, center_y))
+    sx = max(0.01, min(1.0, span_x))
+    sy = max(0.01, min(1.0, span_y))
+    half_x = sx * 0.5
+    half_y = sy * 0.5
+    left = cx - half_x
+    right = cx + half_x
+    top = cy - half_y
+    bottom = cy + half_y
+    if left < 0.0:
+        right = min(1.0, right - left)
+        left = 0.0
+    if right > 1.0:
+        left = max(0.0, left - (right - 1.0))
+        right = 1.0
+    if top < 0.0:
+        bottom = min(1.0, bottom - top)
+        top = 0.0
+    if bottom > 1.0:
+        top = max(0.0, top - (bottom - 1.0))
+        bottom = 1.0
+    return (left, top, right, bottom)
+
+
+def _load_focus_box_from_report_db(
+    path: str, width: int, height: int, ref_size: tuple[int, int] | None = None
+) -> tuple[float, float, float, float] | None:
+    """
+    从 report.db 的 focus_x、focus_y 构造焦点框（保底），框大小 128×128 像素。
+    归一化时使用传入的 width/height 作为坐标系。
+    """
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        directory = str(Path(path).parent)
+        stem = Path(path).stem
+        if not stem:
+            return None
+        report_root = find_report_root(directory)
+        if not report_root:
+            return None
+        db = ReportDB.open_if_exists(report_root)
+        if not db:
+            return None
+        try:
+            row = db.get_photo(stem)
+        finally:
+            db.close()
+        if not row:
+            return None
+        fx, fy = row.get("focus_x"), row.get("focus_y")
+        if fx is None or fy is None:
+            return None
+        fx, fy = float(fx), float(fy)
+        ref_w = float(ref_size[0]) if ref_size and len(ref_size) > 0 and int(ref_size[0]) > 0 else float(width)
+        ref_h = float(ref_size[1]) if ref_size and len(ref_size) > 1 and int(ref_size[1]) > 0 else float(height)
+        if ref_w <= 0 or ref_h <= 0:
+            return None
+        if fx <= 1.0 and fy <= 1.0:
+            cx, cy = fx, fy
+        else:
+            cx = max(0.0, min(1.0, fx / ref_w))
+            cy = max(0.0, min(1.0, fy / ref_h))
+        span_x = 128.0 / ref_w
+        span_y = 128.0 / ref_h
+        box = _focus_box_from_center_and_span(cx, cy, span_x, span_y)
+        orientation = _get_orientation_from_file(path)
+        _log.info(
+            "[_load_focus_box_from_report_db] path=%r focus=(%s,%s) ref_size=%sx%s box=%r",
+            path,
+            fx,
+            fy,
+            int(ref_w),
+            int(ref_h),
+            box,
+        )
+        return _transform_focus_box_by_orientation(box, orientation)
+    except Exception:
+        _log.exception("[_load_focus_box_from_report_db] path=%r", path)
+        return None
+
+
+def _load_focus_box_for_preview(path: str, width: int, height: int, *, allow_report_db_fallback: bool = True):
     """
     用 focus_calc + exiftool 元数据提取焦点框，返回归一化坐标 (l,t,r,b)。
-    无 exiftool、无匹配元数据或提取失败时返回 None。
+    无元数据或提取失败时尝试 report.db 的 focus_x/focus_y 保底（128×128）。
     """
     if width <= 0 or height <= 0:
         return None
 
-    raw_metadata = None
-    try:
-        primary = extract_metadata_with_xmp_priority(Path(path), mode="auto")
-        if isinstance(primary, dict) and primary:
-            raw_metadata = primary
-    except Exception:
-        raw_metadata = None
-    if raw_metadata is None:
-        raw_metadata = _run_exiftool_json_for_focus(path)
-    if raw_metadata is None:
-        try:
-            lst = run_exiftool_json(path)
-            if lst and isinstance(lst[0], dict):
-                raw_metadata = lst[0]
-        except Exception:
-            raw_metadata = None
+    raw_metadata = _load_focus_metadata_for_path(path)
     if raw_metadata is None:
         _log.info("[_load_focus_box_for_preview] no metadata path=%r", path)
+        if allow_report_db_fallback:
+            focus_box = _load_focus_box_from_report_db(path, width, height)
+            if focus_box is not None:
+                _log.info("[_load_focus_box_for_preview] fallback report_db path=%r focus_box=%r", path, focus_box)
+            return focus_box
         return None
-
-    if Path(path).suffix.lower() in RAW_EXTENSIONS:
-        exifread_extra = _load_exifread_metadata_for_focus(path)
-        if exifread_extra:
-            merged = dict(raw_metadata)
-            merged.update(exifread_extra)
-            raw_metadata = merged
 
     focus_width, focus_height = _resolve_focus_calc_image_size(raw_metadata, fallback=(width, height))
     camera_type = resolve_focus_camera_type_from_metadata(raw_metadata)
@@ -2182,6 +2357,24 @@ def _load_focus_box_for_preview(path: str, width: int, height: int):
             focus_height,
             camera_type=camera_type,
         )
+        if focus_box is None:
+            if allow_report_db_fallback:
+                focus_box = _load_focus_box_from_report_db(path, width, height, ref_size=(focus_width, focus_height))
+                if focus_box is not None:
+                    _log.info(
+                        "[_load_focus_box_for_preview] fallback report_db path=%r focus_box=%r",
+                        path,
+                        focus_box,
+                    )
+                    return focus_box
+            _log.info(
+                "[_load_focus_box_for_preview] focus_calc none path=%r camera_type=%s calc_size=%sx%s",
+                path,
+                str(getattr(camera_type, "value", camera_type)),
+                focus_width,
+                focus_height,
+            )
+            return None
         orientation = _get_orientation_from_file(path)
         mapped_box = _transform_focus_box_by_orientation(focus_box, orientation)
         _log.info(
@@ -2195,7 +2388,23 @@ def _load_focus_box_for_preview(path: str, width: int, height: int):
         return mapped_box
     except Exception:
         _log.exception("[_load_focus_box_for_preview] failed path=%r", path)
+        if allow_report_db_fallback:
+            focus_box = _load_focus_box_from_report_db(path, width, height, ref_size=(focus_width, focus_height))
+            if focus_box is not None:
+                _log.info("[_load_focus_box_for_preview] fallback report_db after exception path=%r", path)
+            return focus_box
         return None
+
+
+def _resolve_focus_report_fallback_ref_size(path: str, fallback: tuple[int, int]) -> tuple[int, int]:
+    raw_metadata = _load_focus_metadata_for_path(path)
+    if isinstance(raw_metadata, dict) and raw_metadata:
+        return _resolve_focus_calc_image_size(raw_metadata, fallback=fallback)
+    fw = int(fallback[0]) if fallback and len(fallback) > 0 else 0
+    fh = int(fallback[1]) if fallback and len(fallback) > 1 else 0
+    if fw > 0 and fh > 0:
+        return (fw, fh)
+    return (1, 1)
 
 
 class FocusBoxLoader(QThread):
@@ -2232,7 +2441,12 @@ class FocusBoxLoader(QThread):
             if self.isInterruptionRequested():
                 _log.info("[FocusBoxLoader.run] interrupted request_id=%s", self._request_id)
                 return
-            focus_box = _load_focus_box_for_preview(candidate_path, self._width, self._height)
+            focus_box = _load_focus_box_for_preview(
+                candidate_path,
+                self._width,
+                self._height,
+                allow_report_db_fallback=False,
+            )
             _log.info(
                 "[FocusBoxLoader.run] tried request_id=%s label=%s path=%r focus_box=%r",
                 self._request_id,
@@ -2245,7 +2459,26 @@ class FocusBoxLoader(QThread):
                 return
 
         fallback_used_path = self._source_path or self._preview_path
-        self.focus_loaded.emit(self._request_id, None, fallback_used_path)
+        fallback_box = None
+        if fallback_used_path and os.path.isfile(fallback_used_path):
+            fallback_ref_size = _resolve_focus_report_fallback_ref_size(
+                fallback_used_path,
+                fallback=(self._width, self._height),
+            )
+            fallback_box = _load_focus_box_from_report_db(
+                fallback_used_path,
+                self._width,
+                self._height,
+                ref_size=fallback_ref_size,
+            )
+            _log.info(
+                "[FocusBoxLoader.run] report fallback request_id=%s path=%r ref_size=%s focus_box=%r",
+                self._request_id,
+                fallback_used_path,
+                fallback_ref_size,
+                fallback_box,
+            )
+        self.focus_loaded.emit(self._request_id, fallback_box, fallback_used_path)
 
 
 def _resolve_focus_calc_image_size(raw_metadata: dict, fallback: tuple[int, int]) -> tuple[int, int]:
@@ -2883,7 +3116,7 @@ class MainWindow(QMainWindow):
 
         # ── 面板 2：图像文件列表 ──
         self._file_list = FileListPanel()
-        self._file_list.setMinimumWidth(160)
+        self._file_list.setMinimumWidth(520)
         splitter.addWidget(self._file_list)
 
         # 连接目录选择 → 文件列表加载
@@ -2946,7 +3179,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(group)
 
         # 各面板初始宽度：目录树 200 | 文件列表 320 | 预览 380 | EXIF 320
-        splitter.setSizes([200, 320, 380, 320])
+        splitter.setSizes([220, 680, 520, 340])
         layout.addWidget(splitter)
 
         self._current_exif_path = None
@@ -3279,7 +3512,7 @@ def main():
     palette.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
     app.setPalette(palette)
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 
