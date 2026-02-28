@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('EXIF.cfg', '.'),
+        ('super_viewer.cfg', '.'),
         ('image/superexif.png', 'image'),
         ('image/superexif.ico', 'image'),
         ('app_common/about_dialog/osk_banner.jpg', 'app_common/about_dialog'),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Quick CLI for validating SuperEXIF focus extraction on a single source file.
+Quick CLI for validating Super Viewer focus extraction on a single source file.
 
 Usage:
   .venv\\Scripts\\python.exe scripts\\focus_extract_cli.py "F:\\path\\to\\file.ARW"

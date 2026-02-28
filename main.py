@@ -238,7 +238,7 @@ EXIFTOOL_IFD_GROUP_MAP = {
 
 
 # 与主程序同目录下的配置文件
-CONFIG_FILENAME = "EXIF.cfg"
+CONFIG_FILENAME = "super_viewer.cfg"
 _log = get_logger("main")
 META_IFD_NAME = "Meta"
 META_TITLE_TAG_ID = "Title"
@@ -303,7 +303,7 @@ def _get_app_icon_path() -> str | None:
 
 
 def _get_config_path() -> str:
-    """返回 EXIF.cfg 的完整路径，与当前运行的主程序同目录。"""
+    """返回 super_viewer.cfg 的完整路径，与当前运行的主程序同目录。"""
     app_dir = _get_app_dir()
     return os.path.join(app_dir, CONFIG_FILENAME)
 
@@ -908,7 +908,7 @@ def _format_english_tag_name(name: str) -> str:
 
 
 def load_tag_name_token_map_zh_from_settings(data: dict | None = None) -> dict:
-    """从 EXIF.cfg 读取标签分词中文映射（exif_tag_name_token_map_zh）。"""
+    """从 super_viewer.cfg 读取标签分词中文映射（exif_tag_name_token_map_zh）。"""
     default_map = {}
     if data is None:
         data = _load_settings()
@@ -970,7 +970,7 @@ def _build_default_exif_tag_names_zh(token_map: dict | None = None) -> dict:
 
 
 def load_exif_tag_names_zh_from_settings() -> dict:
-    """从 EXIF.cfg 读取 EXIF 标签中文名映射（key 为 ifd_name:tag_id），并补全缺失项。"""
+    """从 super_viewer.cfg 读取 EXIF 标签中文名映射（key 为 ifd_name:tag_id），并补全缺失项。"""
     data = _load_settings()
     token_map = load_tag_name_token_map_zh_from_settings(data)
     merged = _build_default_exif_tag_names_zh(token_map=token_map)
@@ -1331,7 +1331,7 @@ def _format_exception_message(e: Exception) -> str:
 
 def _build_windows_app_id(app_name: str) -> str:
     """构造稳定的 Windows AppUserModelID。"""
-    base = re.sub(r"[^A-Za-z0-9.]+", "", app_name) or "SuperEXIF"
+    base = re.sub(r"[^A-Za-z0-9.]+", "", app_name) or "SuperViewer"
     return f"oskch.{base}"
 
 
@@ -1392,7 +1392,7 @@ def _apply_runtime_app_identity(app_name: str):
     - macOS: 设置 NSProcessInfo 名称与 NSBundle 名称字段
     - Windows: 设置 AppUserModelID
     """
-    name = _sanitize_display_string(app_name or "SuperEXIF") or "SuperEXIF"
+    name = _sanitize_display_string(app_name or "Super Viewer") or "Super Viewer"
 
     if sys.platform == "darwin":
         pyobjc_process_name_ok = False
@@ -1588,7 +1588,7 @@ DEFAULT_EXIF_TAG_PRIORITY = [
 
 
 def load_tag_priority_from_settings() -> list:
-    """从 EXIF.cfg 读取优先显示的 tag key 列表，缺省时返回内置默认顺序。"""
+    """从 super_viewer.cfg 读取优先显示的 tag key 列表，缺省时返回内置默认顺序。"""
     data = _load_settings()
     val = data.get("exif_tag_priority", [])
     lst = list(val) if isinstance(val, list) else []
@@ -1618,7 +1618,7 @@ def save_tag_priority_to_settings(priority_keys: list):
 
 
 def load_exif_tag_hidden_from_settings() -> set:
-    """从 EXIF.cfg 读取禁止显示的 tag key 集合（ifd:tag_id），如 0th:279。仅由 cfg 配置，无默认项。"""
+    """从 super_viewer.cfg 读取禁止显示的 tag key 集合（ifd:tag_id），如 0th:279。仅由 cfg 配置，无默认项。"""
     data = _load_settings()
     val = data.get("exif_tag_hidden", [])
     lst = val if isinstance(val, list) else []
@@ -3089,9 +3089,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         info = load_about_info(_get_config_path())
         version = info.get("version", "").strip()
-        title = f"SuperEXIF - 图片 EXIF 查看与编辑器 by osk.ch"
+        title = f"Super Viewer - 图片 EXIF 查看与编辑器 by osk.ch"
         if version:
-            title = f"SuperEXIF {version} - 图片 EXIF 查看与编辑器 by osk.ch"
+            title = f"Super Viewer {version} - 图片 EXIF 查看与编辑器 by osk.ch"
         self.setWindowTitle(title)
         self.setMinimumSize(900, 600)
         self.resize(1500, 960)
@@ -3132,7 +3132,7 @@ class MainWindow(QMainWindow):
         app_info_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
         app_info_widget = AppInfoBar(
             self,
-            title="Super EXIF",
+            title="Super Viewer",
             subtitle="查看与编辑EXIF",
             icon_path=app_info_path,
             on_about_clicked=self._show_about_dialog,
@@ -3491,7 +3491,7 @@ class MainWindow(QMainWindow):
 
 def main():
     about_info = load_about_info(_get_config_path())
-    app_name = _sanitize_display_string(about_info.get("app_name", "SuperEXIF")) or "SuperEXIF"
+    app_name = _sanitize_display_string(about_info.get("app_name", "Super Viewer")) or "Super Viewer"
     _apply_runtime_app_identity(app_name)
     app = QApplication(sys.argv)
     if hasattr(app, "setApplicationName"):
