@@ -302,6 +302,44 @@ def _get_app_icon_path() -> str | None:
     return None
 
 
+LAST_FOLDER_FILENAME = ".last_folder.txt"
+
+
+def _get_last_folder_file_path() -> str:
+    """返回与 app exe 同目录的 .last_folder.txt 的完整路径。"""
+    return os.path.join(_get_app_dir(), LAST_FOLDER_FILENAME)
+
+
+def load_last_folder_from_file() -> str | None:
+    """从 .last_folder.txt 读取上次打开的目录；文件不存在或路径无效时返回 None。"""
+    path = _get_last_folder_file_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return None
+        raw = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(raw):
+            return None
+        return raw
+    except Exception:
+        return None
+
+
+def save_last_folder_to_file(path: str) -> None:
+    """将上次打开的目录写入 .last_folder.txt（与 app exe 同目录）。"""
+    if not path or not os.path.isdir(path):
+        return
+    try:
+        file_path = _get_last_folder_file_path()
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(os.path.abspath(path))
+    except Exception:
+        pass
+
+
 def _get_config_path() -> str:
     """返回 super_viewer.cfg 的完整路径，与当前运行的主程序同目录。"""
     app_dir = _get_app_dir()
@@ -3229,13 +3267,16 @@ class MainWindow(QMainWindow):
         return rows
 
     def _on_directory_selected(self, path: str):
-        """目录树选中目录后，保存路径并刷新文件列表。"""
+        """目录树选中目录后，保存路径到设置与 .last_folder.txt，并刷新文件列表。"""
         save_last_selected_directory_to_settings(path)
+        save_last_folder_to_file(path)
         self._file_list.load_directory(path)
 
     def _restore_last_selected_directory(self) -> None:
-        """启动时恢复并展开上次选中的目录。"""
-        last_dir = load_last_selected_directory_from_settings()
+        """启动时从 .last_folder.txt 或设置恢复并展开上次选中的目录。"""
+        last_dir = load_last_folder_from_file()
+        if last_dir is None:
+            last_dir = load_last_selected_directory_from_settings()
         if not last_dir:
             return
         try:

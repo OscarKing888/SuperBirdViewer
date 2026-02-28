@@ -14,6 +14,7 @@
 
 * 主界面
 [![主界面](./image/manual/MainCH.png)](./image/manual/MainCH.png)
+[![主界面](./image/manual/MainEng.png)](./image/manual/MainEng.png)
 * 自定义显示顺序
 [![自定义显示顺序](./image/manual/CustomEdit.png)](./image/manual/CustomEdit.png)
 * 自定义隐藏标签
