@@ -28,7 +28,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='SuperEXIF',
+    name='SuperViewer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -48,11 +48,11 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='SuperEXIF',
+    name='SuperViewer',
 )
 app = BUNDLE(
     coll,
-    name='SuperEXIF.app',
+    name='SuperViewer.app',
     icon='image/superexif.icns',
     bundle_identifier=None,
 )

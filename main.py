@@ -93,7 +93,7 @@ except ImportError:
         QStackedWidget,
         QSlider,
     )
-    from PyQt.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
+    from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush
 
 from app_common import show_about_dialog, load_about_info, AppInfoBar
@@ -3556,6 +3556,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # 打包运行时将工作目录设为 exe 所在目录，便于资源与插件加载
+    if getattr(sys, "frozen", False):
+        app_dir = os.path.dirname(os.path.abspath(sys.executable))
+        if app_dir and os.path.isdir(app_dir):
+            os.chdir(app_dir)
     about_info = load_about_info(_get_config_path())
     app_name = _get_product_display_name(about_info)
     _apply_runtime_app_identity(app_name)
@@ -3583,4 +3588,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:  # 打包后无控制台时把错误写入文件便于排查
+        if getattr(sys, "frozen", False):
+            import traceback
+            app_dir = os.path.dirname(os.path.abspath(sys.executable))
+            log_path = os.path.join(app_dir, "superviewer_error.txt")
+            try:
+                with open(log_path, "w", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
+        raise

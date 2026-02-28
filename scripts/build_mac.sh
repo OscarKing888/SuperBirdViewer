@@ -12,4 +12,4 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
   --clean \
   SuperEXIF_mac.spec
 
-echo "[OK] 打包完成: dist/SuperEXIF.app"
+echo "[OK] 打包完成: dist/SuperViewer.app"

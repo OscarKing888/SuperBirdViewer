@@ -22,13 +22,13 @@ if defined VIRTUAL_ENV (
   SuperEXIF_win.spec
 if errorlevel 1 goto :end
 
-echo [OK] 打包完成: dist\SuperEXIF
+echo [OK] 打包完成: dist\SuperViewer
 
 set "SUFFIX=%~1"
 if not "%SUFFIX%"=="" (
-  set "ZIP_NAME=SuperEXIF%SUFFIX%.zip"
-  powershell -NoProfile -Command "Compress-Archive -Path 'dist\SuperEXIF' -DestinationPath 'dist\SuperEXIF%SUFFIX%.zip' -Force"
-  echo [OK] ZIP 已生成: dist\SuperEXIF%SUFFIX%.zip
+  set "ZIP_NAME=SuperViewer%SUFFIX%.zip"
+  powershell -NoProfile -Command "Compress-Archive -Path 'dist\SuperViewer' -DestinationPath 'dist\SuperViewer%SUFFIX%.zip' -Force"
+  echo [OK] ZIP 已生成: dist\SuperViewer%SUFFIX%.zip
 )
 
 :end
