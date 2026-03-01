@@ -10,7 +10,6 @@ a = Analysis(
         ('image/superexif.png', 'image'),
         ('image/superexif.ico', 'image'),
         ('image/superexif.icns', 'image'),
-        ('app_common/about_dialog/osk_banner.jpg', 'app_common/about_dialog'),
         ('app_common/exif_io/exiftools_mac', 'app_common/exif_io/exiftools_mac'),
     ],
     hiddenimports=[],
