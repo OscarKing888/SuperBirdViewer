@@ -5,21 +5,59 @@ set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..") do set "ROOT_DIR=%%~fI"
 cd /d "%ROOT_DIR%"
 
-if defined VIRTUAL_ENV (
-  set "PYTHON_BIN=%VIRTUAL_ENV%\Scripts\python.exe"
-) else (
-  where py >nul 2>nul
-  if %errorlevel%==0 (
-    set "PYTHON_BIN=py -3"
-  ) else (
-    set "PYTHON_BIN=python"
-  )
+if exist "%ROOT_DIR%\.venv\Scripts\python.exe" (
+  set "PYTHON_EXE=%ROOT_DIR%\.venv\Scripts\python.exe"
+  goto :build_with_exe
 )
 
-%PYTHON_BIN% -m PyInstaller ^
+if defined VIRTUAL_ENV if exist "%VIRTUAL_ENV%\Scripts\python.exe" (
+  set "PYTHON_EXE=%VIRTUAL_ENV%\Scripts\python.exe"
+  goto :build_with_exe
+)
+
+where py >nul 2>nul
+if %errorlevel%==0 goto :build_with_launcher
+goto :build_with_python
+
+:build_with_exe
+echo [INFO] Using Python: %PYTHON_EXE%
+"%PYTHON_EXE%" -c "import PyQt6" >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] Selected Python does not have PyQt6: %PYTHON_EXE%
+  goto :end
+)
+"%PYTHON_EXE%" -m PyInstaller ^
   --noconfirm ^
   --clean ^
   SuperEXIF_win.spec
+goto :after_build
+
+:build_with_launcher
+echo [INFO] Using Python launcher: py -3
+py -3 -c "import PyQt6" >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] Python launcher py -3 does not resolve to an environment with PyQt6.
+  goto :end
+)
+py -3 -m PyInstaller ^
+  --noconfirm ^
+  --clean ^
+  SuperEXIF_win.spec
+goto :after_build
+
+:build_with_python
+echo [INFO] Using Python: python
+python -c "import PyQt6" >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] Python does not have PyQt6: python
+  goto :end
+)
+python -m PyInstaller ^
+  --noconfirm ^
+  --clean ^
+  SuperEXIF_win.spec
+
+:after_build
 if errorlevel 1 goto :end
 
 echo [OK] 打包完成: dist\SuperViewer

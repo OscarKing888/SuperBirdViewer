@@ -55,7 +55,7 @@ try:
     from PyQt6.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
     from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QFileSystemModel, QPainter, QBrush
 except ImportError:
-    from PyQt6.QtWidgets import (
+    from PyQt5.QtWidgets import (
         QApplication,
         QMainWindow,
         QWidget,
@@ -291,8 +291,6 @@ def _get_resource_path(relative_path: str) -> str | None:
         if os.path.isfile(path):
             return path
     return None
-
-
 def _get_app_icon_path() -> str | None:
     """返回应用图标路径。"""
     for rel in APP_ICON_CANDIDATES:
