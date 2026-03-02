@@ -52,7 +52,7 @@ try:
         QStackedWidget,
         QSlider,
     )
-    from PyQt6.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
+    from PyQt6.QtCore import Qt, QMimeData, QSize, QDir, QThread, QTimer, pyqtSignal, QModelIndex, QRect
     from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QFileSystemModel, QPainter, QBrush
 except ImportError:
     from PyQt5.QtWidgets import (
@@ -93,7 +93,7 @@ except ImportError:
         QStackedWidget,
         QSlider,
     )
-    from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, pyqtSignal, QModelIndex, QRect
+    from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, QTimer, pyqtSignal, QModelIndex, QRect
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush
 
 from app_common import show_about_dialog, load_about_info, AppInfoBar
@@ -113,6 +113,14 @@ from app_common.file_browser import DirectoryBrowserWidget, FileListPanel
 from app_common.focus_calc import extract_focus_box, resolve_focus_camera_type_from_metadata
 from app_common.preview_canvas import PreviewCanvas, PreviewOverlayOptions, PreviewOverlayState
 from app_common.report_db import PHOTO_COLUMNS, find_report_root, ReportDB
+from app_common.send_to_app import (
+    get_initial_file_list_from_argv,
+    send_file_list_to_running_app,
+    SingleInstanceReceiver,
+    send_files_to_app,
+    get_external_apps,
+)
+from app_common.send_to_app.settings_ui import show_external_apps_settings_dialog
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -3149,7 +3157,7 @@ class ExifTagOrderDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, initial_received_files=None):
         super().__init__()
         info = load_about_info(_get_config_path())
         product_name = _get_product_display_name(info)
@@ -3250,7 +3258,8 @@ class MainWindow(QMainWindow):
         # preview_panel 的 parent 为 central，回调挂在 left_widget 上供拖放/选图后调用
         left_widget.on_image_loaded = self.on_image_loaded
 
-        self._restore_last_selected_directory()
+        if not initial_received_files:
+            self._restore_last_selected_directory()
 
     def _get_report_row_for_current_path(self, path: str) -> dict | None:
         try:
@@ -3346,10 +3355,58 @@ class MainWindow(QMainWindow):
         return ""
 
     def _init_menu_bar(self):
+        file_menu = self.menuBar().addMenu("文件")
+        extern_apps = get_external_apps(_get_app_dir())
+        if extern_apps:
+            send_menu = file_menu.addMenu("发送到外部应用")
+            for app in extern_apps:
+                name = (app.get("name") or app.get("path") or "未命名").strip()
+                act = QAction(name, self)
+                act.triggered.connect(lambda checked=False, a=app: self._send_to_external_app(a))
+                send_menu.addAction(act)
+        settings_act = QAction("外部应用设置...", self)
+        settings_act.triggered.connect(self._open_external_apps_settings)
+        file_menu.addAction(settings_act)
+        file_menu.addSeparator()
+
         help_menu = self.menuBar().addMenu("帮助")
         about_action = QAction("关于...", self)
         about_action.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_action)
+
+    def _send_to_external_app(self, app: dict) -> None:
+        """将当前选中的文件发送到指定外部应用。"""
+        if not self._current_exif_path or not os.path.isfile(self._current_exif_path):
+            QMessageBox.information(self, "发送", "请先选择要发送的文件。")
+            return
+        send_files_to_app([self._current_exif_path], app, base_directory=_get_app_dir())
+
+    def _open_external_apps_settings(self) -> None:
+        def on_saved():
+            self.menuBar().clear()
+            self._init_menu_bar()
+
+        show_external_apps_settings_dialog(self, config_dir=_get_app_dir(), on_saved=on_saved)
+
+    def _on_received_file_list(self, paths: list) -> None:
+        """由单例 IPC 或启动时传入的文件列表回调（在主线程执行）。"""
+        if not paths:
+            return
+        self._open_received_file_list(paths)
+
+    def _open_received_file_list(self, paths: list) -> None:
+        """打开「发送到本应用」收到的文件列表：与目录列表多选同等——打开首文件所在目录，待加载完成后多选收到的路径。"""
+        if not paths:
+            return
+        normalized = [os.path.abspath(os.path.normpath(str(p))) for p in paths if p]
+        if not normalized:
+            return
+        first = normalized[0]
+        parent = os.path.dirname(first)
+        if not parent or not os.path.isdir(parent):
+            return
+        self._file_list.set_pending_selection(normalized)
+        self._dir_browser.select_directory(parent, emit_signal=True)
 
     def _show_about_dialog(self):
         info = load_about_info(_get_config_path())
@@ -3562,7 +3619,14 @@ def main():
     about_info = load_about_info(_get_config_path())
     app_name = _get_product_display_name(about_info)
     _apply_runtime_app_identity(app_name)
+
+    # 冷启动/二次启动：解析命令行文件列表，若已有实例在运行则转发后退出
+    # 先创建 QApplication，以便第二实例使用 QLocalSocket 时 Qt 已初始化（跨平台）
     app = QApplication(sys.argv)
+    argv_files = get_initial_file_list_from_argv()
+    app_id = (app_name or "SuperEXIF").strip()
+    if argv_files and send_file_list_to_running_app(app_id, argv_files):
+        return
     if hasattr(app, "setApplicationName"):
         app.setApplicationName(app_name)
     if hasattr(app, "setApplicationDisplayName"):
@@ -3580,8 +3644,25 @@ def main():
     palette.setColor(QPalette.ColorRole.AlternateBase, QColor(50, 50, 50))
     palette.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
     app.setPalette(palette)
-    window = MainWindow()
+    window = MainWindow(initial_received_files=argv_files if argv_files else None)
+
+    # 单例接收：其它进程「发送到本应用」时回调到主线程
+    def on_files_received(paths):
+        QTimer.singleShot(0, (lambda p: lambda: window._on_received_file_list(p))(paths))
+
+    receiver = SingleInstanceReceiver(app_id, on_files_received)
+    if not receiver.start():
+        _log.warning("[main] SingleInstanceReceiver failed to listen (another instance may be running)")
+    window._single_instance_receiver = receiver
+
+    def stop_receiver():
+        if getattr(window, "_single_instance_receiver", None):
+            window._single_instance_receiver.stop()
+
+    app.aboutToQuit.connect(stop_receiver)
     window.showMaximized()
+    if argv_files:
+        QTimer.singleShot(100, (lambda p: lambda: window._open_received_file_list(p))(argv_files))
     sys.exit(app.exec())
 
 
