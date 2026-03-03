@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SPEC_PATH = ROOT_DIR / "SuperEXIF_win.spec"
+SPEC_PATH = ROOT_DIR / "SuperViewer_win.spec"
 DIST_DIR = ROOT_DIR / "dist" / "SuperViewer"
 MAX_ATTEMPTS = 5
 

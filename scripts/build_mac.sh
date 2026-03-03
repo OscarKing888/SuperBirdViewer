@@ -10,6 +10,6 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 "${PYTHON_BIN}" -m PyInstaller \
   --noconfirm \
   --clean \
-  SuperEXIF_mac.spec
+  SuperViewer_mac.spec
 
 echo "[OK] 打包完成: dist/SuperViewer.app"

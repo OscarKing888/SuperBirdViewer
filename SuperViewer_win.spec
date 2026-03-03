@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# macOS 打包用：仅包含 exiftools_mac，不包含 exiftools_win
+# Windows 打包用：仅包含 exiftools_win，不包含 exiftools_mac
 
 a = Analysis(
     ['main.py'],
@@ -7,10 +7,9 @@ a = Analysis(
     binaries=[],
     datas=[
         ('super_viewer.cfg', '.'),
-        ('image/superexif.png', 'image'),
-        ('image/superexif.ico', 'image'),
-        ('image/superexif.icns', 'image'),
-        ('app_common/exif_io/exiftools_mac', 'app_common/exif_io/exiftools_mac'),
+        ('icons/app_icon.png', 'icons'),
+        ('icons/app_icon.ico', 'icons'),
+        ('app_common/exif_io/exiftools_win', 'app_common/exif_io/exiftools_win'),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -31,27 +30,21 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['image/superexif.icns'],
+    icon='icons/app_icon.ico',
 )
 coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='SuperViewer',
-)
-app = BUNDLE(
-    coll,
-    name='SuperViewer.app',
-    icon='image/superexif.icns',
-    bundle_identifier=None,
 )

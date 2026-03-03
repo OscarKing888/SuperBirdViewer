@@ -268,9 +268,9 @@ EXIFTOOL_KEYS_DUPLICATE_OF_DESCRIPTION = frozenset(
     }
 )
 APP_ICON_CANDIDATES = (
-    os.path.join("image", "superexif.png"),
-    os.path.join("image", "superexif.ico"),
-    os.path.join("image", "superexif.icns"),
+    os.path.join("image", "app_icon.png"),
+    os.path.join("image", "app_icon.ico"),
+    os.path.join("image", "app_icon.icns"),
 )
 def _get_app_dir() -> str:
     """返回当前程序目录（脚本目录或打包后可执行文件目录）。"""
@@ -3198,7 +3198,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        app_info_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
+        app_info_path = _get_resource_path("icons/app_icon.png") or _get_app_icon_path()
         app_info_widget = AppInfoBar(
             self,
             title=product_name,
@@ -3410,7 +3410,7 @@ class MainWindow(QMainWindow):
 
     def _show_about_dialog(self):
         info = load_about_info(_get_config_path())
-        logo_path = _get_resource_path("image/superexif.png") or _get_app_icon_path()
+        logo_path = _get_resource_path("icons/app_icon.png") or _get_app_icon_path()
         show_about_dialog(self, info, logo_path=logo_path)
 
     def _on_preview_overlay_toggled(self, _checked: bool) -> None:
@@ -3624,7 +3624,7 @@ def main():
     # 先创建 QApplication，以便第二实例使用 QLocalSocket 时 Qt 已初始化（跨平台）
     app = QApplication(sys.argv)
     argv_files = get_initial_file_list_from_argv()
-    app_id = (app_name or "SuperEXIF").strip()
+    app_id = (app_name or "SuperViewer").strip()
     if argv_files and send_file_list_to_running_app(app_id, argv_files):
         return
     if hasattr(app, "setApplicationName"):

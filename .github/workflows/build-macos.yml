@@ -32,7 +32,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pyinstaller
 
-      - name: Build (SuperEXIF_mac.spec)
+      - name: Build (SuperViewer_mac.spec)
         shell: bash
         run: |
           bash scripts/build_mac.sh
@@ -40,20 +40,20 @@ jobs:
       - name: Pack app zip
         shell: bash
         run: |
-          if [ ! -d "dist/SuperEXIF.app" ]; then
-            echo "dist/SuperEXIF.app not found"
+          if [ ! -d "dist/SuperViewer.app" ]; then
+            echo "dist/SuperViewer.app not found"
             exit 1
           fi
-          ditto -c -k --sequesterRsrc --keepParent "dist/SuperEXIF.app" "dist/SuperEXIF-macos.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/SuperViewer.app" "dist/SuperViewer-macos.zip"
 
       - name: Upload artifacts (app + zip)
         uses: actions/upload-artifact@v4
         with:
-          name: SuperEXIF-macos
+          name: SuperViewer-macos
           if-no-files-found: error
           path: |
-            dist/SuperEXIF.app
-            dist/SuperEXIF-macos.zip
+            dist/SuperViewer.app
+            dist/SuperViewer-macos.zip
           retention-days: 14
 
       - name: Publish GitHub Release (tag only)
@@ -61,5 +61,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/SuperEXIF-macos.zip
+            dist/SuperViewer-macos.zip
           overwrite_files: true

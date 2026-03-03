@@ -32,7 +32,7 @@ jobs:
           if (Test-Path "requirements.txt") { pip install -r requirements.txt }
           pip install pyinstaller
 
-      - name: Build (SuperEXIF_win.spec)
+      - name: Build (SuperViewer_win.spec)
         shell: cmd
         run: |
           scripts\build_win.bat
@@ -40,20 +40,20 @@ jobs:
       - name: Pack zip
         shell: pwsh
         run: |
-          if (!(Test-Path "dist\\SuperEXIF")) {
-            throw "dist\\SuperEXIF not found"
+          if (!(Test-Path "dist\\SuperViewer")) {
+            throw "dist\\SuperViewer not found"
           }
-          Compress-Archive -Path "dist\\SuperEXIF\\*" -DestinationPath "dist\\SuperEXIF-windows.zip" -Force
+          Compress-Archive -Path "dist\\SuperViewer\\*" -DestinationPath "dist\\SuperViewer-windows.zip" -Force
 
       - name: Upload artifacts (exe + folder + zip)
         uses: actions/upload-artifact@v4
         with:
-          name: SuperEXIF-windows
+          name: SuperViewer-windows
           if-no-files-found: error
           path: |
-            dist\SuperEXIF\SuperEXIF.exe
-            dist\SuperEXIF\**
-            dist\SuperEXIF-windows.zip
+            dist\SuperViewer\SuperViewer.exe
+            dist\SuperViewer\**
+            dist\SuperViewer-windows.zip
           retention-days: 14
 
       - name: Publish GitHub Release (tag only)
@@ -61,5 +61,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/SuperEXIF/SuperEXIF.exe
-            dist/SuperEXIF-windows.zip
+            dist/SuperViewer/SuperViewer.exe
+            dist/SuperViewer-windows.zip

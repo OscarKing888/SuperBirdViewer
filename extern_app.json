@@ -1,0 +1,9 @@
+{
+  "apps": [
+    {
+      "name": "SuperBirdStamp.app",
+      "path": "/Users/oscar/Pictures/BirdStamp/dist/SuperBirdStamp.app",
+      "app_id": "birdstamp"
+    }
+  ]
+}

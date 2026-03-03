@@ -3,6 +3,9 @@
 
 * V0.1.0版本功能
   * 选中`慧眼选鸟`处理过的目录会自动读取数据库并可过滤显示
+  * 支持从`慧眼选鸟`发送文件到本应用
+  * 支持发送文件到`Super Birdstamp`切图工具
+    * https://github.com/OscarKing888/SuperBirdStamp.git
   * 支持星级、文件名、精选（奖杯）过滤
   * 文件列表可排序
   * 右键菜单可复制粘贴鸟名，并写入数据库
@@ -13,19 +16,21 @@
   * 额外增加了超焦距计算，公式为 H = f^2 / (N * c) + f，其中 f=焦距(mm), N=光圈值, c=弥散圆(mm)。
 
 * 主界面
-[![主界面](./image/manual/MainCH.png)](./image/manual/MainCH.png)
-[![主界面](./image/manual/MainEng.png)](./image/manual/MainEng.png)
+[![主界面](./manual/images/MainCH.png)](./manual/images/MainCH.png)
+[![主界面](./manual/images/MainEng.png)](./manual/images/MainEng.png)
 * 自定义显示顺序
-[![自定义显示顺序](./image/manual/CustomEdit.png)](./image/manual/CustomEdit.png)
+[![自定义显示顺序](./manual/images/CustomEdit.png)](./manual/images/CustomEdit.png)
 * 自定义隐藏标签
-[![自定义隐藏标签](./image/manual/CustomEditHiddenTag.png)](./image/manual/CustomEditHiddenTag.png)
+[![自定义隐藏标签](./manual/images/CustomEditHiddenTag.png)](./manual/images/CustomEditHiddenTag.png)
 
 # 关于作者
 小红书 @追鸟奇遇记 https://xhslink.com/m/A2cowPsYj8P
 
 
 # 友情链接：慧眼选鸟
-小红书 @詹姆斯摄影 https://xhslink.com/m/3UWGeUJqUi0
+* 官网：https://superpicky.app
 
-开源库：https://github.com/jamesphotography/SuperPicky
-[![友情链接：慧眼选鸟](https://raw.githubusercontent.com/jamesphotography/SuperPicky/master/img/icon.png)](https://github.com/jamesphotography/SuperPicky)
+* 小红书 @詹姆斯摄影 https://xhslink.com/m/3UWGeUJqUi0
+
+*开源库：https://github.com/jamesphotography/SuperPicky
+[![友情链接：慧眼选鸟](https://raw.githubusercontent.com/jamesphotography/SuperPicky/master/img/icon.png)](https://superpicky.app)
