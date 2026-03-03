@@ -268,9 +268,9 @@ EXIFTOOL_KEYS_DUPLICATE_OF_DESCRIPTION = frozenset(
     }
 )
 APP_ICON_CANDIDATES = (
-    os.path.join("image", "app_icon.png"),
-    os.path.join("image", "app_icon.ico"),
-    os.path.join("image", "app_icon.icns"),
+    os.path.join("icons", "app_icon.png"),
+    os.path.join("icons", "app_icon.ico"),
+    os.path.join("icons", "app_icon.icns"),
 )
 def _get_app_dir() -> str:
     """返回当前程序目录（脚本目录或打包后可执行文件目录）。"""
