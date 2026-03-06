@@ -322,30 +322,42 @@ def _get_app_icon_path() -> str | None:
     return None
 
 
-LAST_FOLDER_FILENAME = ".last_folder.txt"
+LAST_SELECTED_DIRECTORY_FILENAME = "last_selected_directory.txt"
+LEGACY_LAST_FOLDER_FILENAME = ".last_folder.txt"
 
 
-def _get_last_folder_file_path() -> str:
+def _get_last_selected_directory_file_path() -> str:
     """返回与 app exe 同目录的 .last_folder.txt 的完整路径。"""
-    return os.path.join(_get_app_dir(), LAST_FOLDER_FILENAME)
+    return os.path.join(_get_app_dir(), LAST_SELECTED_DIRECTORY_FILENAME)
 
 
-def load_last_folder_from_file() -> str | None:
-    """从 .last_folder.txt 读取上次打开的目录；文件不存在或路径无效时返回 None。"""
-    path = _get_last_folder_file_path()
+def _get_legacy_last_folder_file_path() -> str:
+    """兼容旧版 .last_folder.txt。"""
+    return os.path.join(_get_app_dir(), LEGACY_LAST_FOLDER_FILENAME)
+
+
+def _read_last_selected_directory_file(path: str) -> str | None:
     if not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
-        if not raw:
-            return None
-        raw = os.path.abspath(os.path.expanduser(raw))
-        if not os.path.isdir(raw):
-            return None
-        return raw
+            raw = f.readline().strip()
     except Exception:
         return None
+    if not raw:
+        return None
+    resolved = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isdir(resolved):
+        return None
+    return resolved
+
+
+def load_last_folder_from_file() -> str | None:
+    """从 .last_folder.txt 读取上次打开的目录；文件不存在或路径无效时返回 None。"""
+    path = _read_last_selected_directory_file(_get_last_selected_directory_file_path())
+    if path:
+        return path
+    return _read_last_selected_directory_file(_get_legacy_last_folder_file_path())
 
 
 def save_last_folder_to_file(path: str) -> None:
@@ -353,7 +365,7 @@ def save_last_folder_to_file(path: str) -> None:
     if not path or not os.path.isdir(path):
         return
     try:
-        file_path = _get_last_folder_file_path()
+        file_path = _get_last_selected_directory_file_path()
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(os.path.abspath(path))
     except Exception:
@@ -385,6 +397,7 @@ def _load_settings() -> dict:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                data.pop("last_selected_directory", None)
                 return data
         except Exception:
             continue
@@ -395,6 +408,8 @@ def _save_settings(data: dict):
     """写入 EXIF.cfg（UTF-8）。"""
     path = _get_config_path()
     try:
+        data = dict(data or {})
+        data.pop("last_selected_directory", None)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -500,26 +515,14 @@ class SuperViewerUserOptionsDialog(QDialog):
 
 def load_last_selected_directory_from_settings() -> str | None:
     """读取上次在目录树中选中的目录路径。"""
-    data = _load_settings()
-    raw = data.get("last_selected_directory")
-    if not isinstance(raw, str):
-        return None
-    path = raw.strip()
-    if not path:
-        return None
-    path = os.path.abspath(os.path.expanduser(path))
-    if not os.path.isdir(path):
-        return None
-    return path
+    return load_last_folder_from_file()
 
 
 def save_last_selected_directory_to_settings(path: str) -> None:
     """保存目录树最后一次选中的目录路径。"""
-    if not path or not os.path.isdir(path):
-        return
-    data = _load_settings()
-    data["last_selected_directory"] = os.path.abspath(path)
-    _save_settings(data)
+    save_last_folder_to_file(path)
+    if os.path.isfile(_get_config_path()):
+        _save_settings(_load_settings())
 
 # IFD 分组显示名称
 IFD_DISPLAY_NAMES = {
@@ -3388,14 +3391,11 @@ class MainWindow(QMainWindow):
     def _on_directory_selected(self, path: str):
         """目录树选中目录后，保存路径到设置与 .last_folder.txt，并刷新文件列表。"""
         save_last_selected_directory_to_settings(path)
-        save_last_folder_to_file(path)
         self._file_list.load_directory(path)
 
     def _restore_last_selected_directory(self) -> None:
         """启动时从 .last_folder.txt 或设置恢复并展开上次选中的目录。"""
-        last_dir = load_last_folder_from_file()
-        if last_dir is None:
-            last_dir = load_last_selected_directory_from_settings()
+        last_dir = load_last_selected_directory_from_settings()
         if not last_dir:
             return
         try:
