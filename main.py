@@ -128,6 +128,7 @@ from app_common.send_to_app.settings_ui import show_external_apps_settings_dialo
 from app_common.superviewer_user_options import (
     USER_OPTIONS_FILENAME,
     PERSISTENT_THUMB_SIZE_LEVELS,
+    KEY_NAVIGATION_FPS_OPTIONS,
     get_user_options_path,
     get_runtime_user_options,
     save_user_options,
@@ -405,7 +406,7 @@ class SuperViewerUserOptionsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("用户选项")
         self.setModal(True)
-        self.resize(520, 220)
+        self.resize(520, 260)
 
         opts = dict(options or get_runtime_user_options())
         cpu_count = max(1, os.cpu_count() or 1)
@@ -455,6 +456,20 @@ class SuperViewerUserOptionsDialog(QDialog):
         grid.addWidget(self._combo_persistent_thumb_size, row, 1)
         grid.addWidget(QLabel("默认 128"), row, 2)
 
+        row += 1
+        grid.addWidget(QLabel("方向键连续浏览速率"), row, 0)
+        self._combo_key_navigation_fps = QComboBox(self)
+        for fps in KEY_NAVIGATION_FPS_OPTIONS:
+            self._combo_key_navigation_fps.addItem(f"{fps} FPS", fps)
+        current_fps = int(opts.get("key_navigation_fps", 24))
+        current_index = KEY_NAVIGATION_FPS_OPTIONS.index(24)
+        if current_fps in KEY_NAVIGATION_FPS_OPTIONS:
+            current_index = KEY_NAVIGATION_FPS_OPTIONS.index(current_fps)
+        self._combo_key_navigation_fps.setCurrentIndex(current_index)
+        self._combo_key_navigation_fps.setToolTip("按住方向键连续浏览时，按该 FPS 节流移动速度。")
+        grid.addWidget(self._combo_key_navigation_fps, row, 1)
+        grid.addWidget(QLabel("默认 24 FPS"), row, 2)
+
         layout.addLayout(grid)
 
         note = QLabel("缩略视图会根据当前缩略图大小自动匹配最合适的一档预览图。")
@@ -479,6 +494,7 @@ class SuperViewerUserOptionsDialog(QDialog):
             "thumbnail_loader_workers": int(self._spin_thumb_loader_workers.value()),
             "persistent_thumb_workers": int(self._spin_persistent_thumb_workers.value()),
             "persistent_thumb_max_size": int(self._combo_persistent_thumb_size.currentData()),
+            "key_navigation_fps": int(self._combo_key_navigation_fps.currentData()),
         }
 
 
