@@ -3191,6 +3191,7 @@ class MainWindow(QMainWindow):
         # 连接目录选择 → 文件列表加载
         self._dir_browser.directory_selected.connect(self._on_directory_selected)
         # 连接文件列表选中 → 预览 + EXIF 刷新
+        self._file_list.file_fast_preview_requested.connect(self._on_file_fast_preview_requested)
         self._file_list.file_selected.connect(self._on_file_selected_from_list)
 
         # ── 面板 3：App 信息 + 文件名 + 拖放预览区 ──
@@ -3297,6 +3298,12 @@ class MainWindow(QMainWindow):
         _log.info("[_on_file_selected_from_list] source=%r preview=%r", path, preview_path)
         self.preview_panel.set_image(preview_path)
         self.on_image_loaded(path)
+
+    def _on_file_fast_preview_requested(self, path: str):
+        """连续方向键长按时，优先用小缩略图刷新 PreviewCanvas。"""
+        preview_path = self._file_list.resolve_preview_path(path, prefer_fast_preview=True)
+        _log.info("[_on_file_fast_preview_requested] source=%r preview=%r", path, preview_path)
+        self.preview_panel.set_image(preview_path)
 
     @staticmethod
     def _find_source_file_by_stem(path: str) -> str | None:
