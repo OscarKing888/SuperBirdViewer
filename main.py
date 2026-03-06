@@ -43,6 +43,8 @@ try:
         QGroupBox,
         QGridLayout,
         QCheckBox,
+        QComboBox,
+        QSpinBox,
         QTabWidget,
         QTreeView,
         QTreeWidget,
@@ -83,6 +85,8 @@ except ImportError:
         QGroupBox,
         QGridLayout,
         QCheckBox,
+        QComboBox,
+        QSpinBox,
         QTabWidget,
         QTreeView,
         QTreeWidget,
@@ -121,6 +125,15 @@ from app_common.send_to_app import (
     get_external_apps,
 )
 from app_common.send_to_app.settings_ui import show_external_apps_settings_dialog
+from app_common.superviewer_user_options import (
+    USER_OPTIONS_FILENAME,
+    PERSISTENT_THUMB_SIZE_LEVELS,
+    get_user_options_path,
+    get_runtime_user_options,
+    save_user_options,
+    reload_runtime_user_options,
+    apply_runtime_user_options,
+)
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -385,6 +398,88 @@ def _save_settings(data: dict):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+class SuperViewerUserOptionsDialog(QDialog):
+    def __init__(self, parent=None, options: dict | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("用户选项")
+        self.setModal(True)
+        self.resize(520, 220)
+
+        opts = dict(options or get_runtime_user_options())
+        cpu_count = max(1, os.cpu_count() or 1)
+        max_workers = max(64, cpu_count * 2)
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            f"配置文件将保存在程序目录：{get_user_options_path()}\n"
+            f"文件名：{USER_OPTIONS_FILENAME}"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; font-size: 12px;")
+        layout.addWidget(info)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+
+        row = 0
+        grid.addWidget(QLabel("后台图像加载线程数"), row, 0)
+        self._spin_thumb_loader_workers = QSpinBox(self)
+        self._spin_thumb_loader_workers.setRange(1, max_workers)
+        self._spin_thumb_loader_workers.setValue(int(opts.get("thumbnail_loader_workers", cpu_count)))
+        self._spin_thumb_loader_workers.setToolTip("缩略图后台加载线程数，默认等于 CPU 逻辑核心数。")
+        grid.addWidget(self._spin_thumb_loader_workers, row, 1)
+        grid.addWidget(QLabel(f"默认 {cpu_count}"), row, 2)
+
+        row += 1
+        grid.addWidget(QLabel("小缩略图生成线程数"), row, 0)
+        self._spin_persistent_thumb_workers = QSpinBox(self)
+        self._spin_persistent_thumb_workers.setRange(1, max_workers)
+        self._spin_persistent_thumb_workers.setValue(int(opts.get("persistent_thumb_workers", cpu_count)))
+        self._spin_persistent_thumb_workers.setToolTip("后台持久化小缩略图生成线程数，默认等于 CPU 逻辑核心数。")
+        grid.addWidget(self._spin_persistent_thumb_workers, row, 1)
+        grid.addWidget(QLabel(f"默认 {cpu_count}"), row, 2)
+
+        row += 1
+        grid.addWidget(QLabel("小缩略图最大尺寸"), row, 0)
+        self._combo_persistent_thumb_size = QComboBox(self)
+        for size in PERSISTENT_THUMB_SIZE_LEVELS:
+            self._combo_persistent_thumb_size.addItem(f"{size} x {size}", size)
+        current_size = int(opts.get("persistent_thumb_max_size", 128))
+        current_index = PERSISTENT_THUMB_SIZE_LEVELS.index(current_size) if current_size in PERSISTENT_THUMB_SIZE_LEVELS else 0
+        self._combo_persistent_thumb_size.setCurrentIndex(current_index)
+        self._combo_persistent_thumb_size.setToolTip("会生成不高于该值的 128/256/512 预览层级。")
+        grid.addWidget(self._combo_persistent_thumb_size, row, 1)
+        grid.addWidget(QLabel("默认 128"), row, 2)
+
+        layout.addLayout(grid)
+
+        note = QLabel("缩略视图会根据当前缩略图大小自动匹配最合适的一档预览图。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #aaa; font-size: 12px;")
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            (
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+                if hasattr(QDialogButtonBox.StandardButton, "Ok")
+                else QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            ),
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_options(self) -> dict[str, int]:
+        return {
+            "thumbnail_loader_workers": int(self._spin_thumb_loader_workers.value()),
+            "persistent_thumb_workers": int(self._spin_persistent_thumb_workers.value()),
+            "persistent_thumb_max_size": int(self._combo_persistent_thumb_size.currentData()),
+        }
 
 
 def load_last_selected_directory_from_settings() -> str | None:
@@ -3376,6 +3471,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(settings_act)
         file_menu.addSeparator()
 
+        settings_menu = self.menuBar().addMenu("设置")
+        user_options_act = QAction("用户选项...", self)
+        user_options_act.triggered.connect(self._open_user_options_dialog)
+        settings_menu.addAction(user_options_act)
+
         help_menu = self.menuBar().addMenu("帮助")
         about_action = QAction("关于...", self)
         about_action.triggered.connect(self._show_about_dialog)
@@ -3394,6 +3494,25 @@ class MainWindow(QMainWindow):
             self._init_menu_bar()
 
         show_external_apps_settings_dialog(self, config_dir=_get_app_dir(), on_saved=on_saved)
+
+    def _open_user_options_dialog(self) -> None:
+        dialog = SuperViewerUserOptionsDialog(self, options=get_runtime_user_options())
+        accepted_code = QDialog.DialogCode.Accepted if hasattr(QDialog, "DialogCode") else QDialog.Accepted
+        if dialog.exec() != accepted_code:
+            return
+        options = dialog.selected_options()
+        try:
+            normalized = save_user_options(options)
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", f"无法写入用户选项：\n{exc}")
+            return
+        apply_runtime_user_options(normalized)
+        self._file_list.apply_user_options()
+        QMessageBox.information(
+            self,
+            "已保存",
+            f"用户选项已保存到：\n{get_user_options_path()}",
+        )
 
     def _on_received_file_list(self, paths: list) -> None:
         """由单例 IPC 或启动时传入的文件列表回调（在主线程执行）。"""
@@ -3623,6 +3742,7 @@ def main():
         app_dir = os.path.dirname(os.path.abspath(sys.executable))
         if app_dir and os.path.isdir(app_dir):
             os.chdir(app_dir)
+    reload_runtime_user_options()
     about_info = load_about_info(_get_config_path())
     app_name = _get_product_display_name(about_info)
     _apply_runtime_app_identity(app_name)
