@@ -2811,6 +2811,7 @@ class PreviewPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         self._canvas = PreviewCanvas(self, placeholder_text="将图片拖入或点击选择")
+        self._canvas.set_keep_view_on_switch(True)
         layout.addWidget(self._canvas, stretch=1)
         self._preview_status_label = QLabel("当前预览分辨率: -")
         self._preview_status_label.setStyleSheet("color: #aaa; font-size: 12px;")
