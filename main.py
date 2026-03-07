@@ -2980,6 +2980,23 @@ class PreviewPanel(QWidget):
         self._show_focus_enabled = bool(enabled)
         self._apply_overlay_options()
 
+    def render_source_pixmap_with_overlays(self) -> QPixmap | None:
+        """返回带当前 overlays 的导出图，供导出逻辑复用。"""
+        return self._canvas.render_source_pixmap_with_overlays()
+
+    def save_source_pixmap_with_overlays(
+        self,
+        path: str,
+        fmt: str | None = None,
+        quality: int = -1,
+    ) -> bool:
+        """
+        保存带当前 overlays 的导出图。
+
+        导出图片时不要直接保存原始 pixmap，统一走这里，避免漏掉焦点框/构图线。
+        """
+        return self._canvas.save_source_pixmap_with_overlays(path, fmt=fmt, quality=quality)
+
     def set_composition_grid_mode(self, mode: str | None) -> None:
         self._composition_grid_mode = normalize_preview_composition_grid_mode(mode)
         self._apply_overlay_options()
@@ -3522,7 +3539,7 @@ class MainWindow(QMainWindow):
         current_line_width = load_preview_grid_line_width_from_settings()
         current_width_index = self.combo_preview_grid_line_width.findData(current_line_width)
         if current_width_index < 0:
-            current_width_index = self.combo_preview_grid_line_width.findData(1)
+            current_width_index = self.combo_preview_grid_line_width.findData(4)
         if current_width_index < 0 and self.combo_preview_grid_line_width.count() > 0:
             current_width_index = 0
         if current_width_index >= 0:
