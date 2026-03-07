@@ -118,7 +118,9 @@ from app_common.focus_calc import extract_focus_box, resolve_focus_camera_type_f
 from app_common.preview_canvas import PreviewCanvas, PreviewOverlayOptions, PreviewOverlayState
 from app_common.report_db import PHOTO_COLUMNS, find_report_root, ReportDB
 from app_common.send_to_app import (
+    ensure_file_open_aware_application,
     get_initial_file_list_from_argv,
+    install_file_open_handler,
     send_file_list_to_running_app,
     SingleInstanceReceiver,
     send_files_to_app,
@@ -3781,8 +3783,11 @@ def main():
     _apply_runtime_app_identity(app_name)
 
     # 冷启动/二次启动：解析命令行文件列表，若已有实例在运行则转发后退出
-    # 先创建 QApplication，以便第二实例使用 QLocalSocket 时 Qt 已初始化（跨平台）
-    app = QApplication(sys.argv)
+    # 先创建支持 macOS QFileOpenEvent 的 QApplication：
+    # 1) 冷启动 open -a App file
+    # 2) 已运行实例接收 Finder/LaunchServices 的热打开事件
+    # 3) 第二实例转发 QLocalSocket 前也已完成 Qt 初始化
+    app = ensure_file_open_aware_application(sys.argv)
     argv_files = get_initial_file_list_from_argv()
     app_id = (app_name or "SuperViewer").strip()
     if argv_files and send_file_list_to_running_app(app_id, argv_files):
@@ -3809,6 +3814,9 @@ def main():
     # 单例接收：其它进程「发送到本应用」时回调到主线程
     def on_files_received(paths):
         QTimer.singleShot(0, (lambda p: lambda: window._on_received_file_list(p))(paths))
+
+    # macOS FileOpen 事件在窗口创建前可能已经到达，这里安装回调后会自动冲刷缓存。
+    install_file_open_handler(app, on_files_received)
 
     receiver = SingleInstanceReceiver(app_id, on_files_received)
     if not receiver.start():
