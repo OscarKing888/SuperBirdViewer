@@ -55,7 +55,7 @@ try:
         QSlider,
     )
     from PyQt6.QtCore import Qt, QMimeData, QSize, QDir, QThread, QTimer, pyqtSignal, QModelIndex, QRect
-    from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QFileSystemModel, QPainter, QBrush
+    from PyQt6.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QFileSystemModel, QPainter, QBrush, QPen
 except ImportError:
     from PyQt5.QtWidgets import (
         QApplication,
@@ -98,7 +98,7 @@ except ImportError:
         QSlider,
     )
     from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, QTimer, pyqtSignal, QModelIndex, QRect
-    from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush
+    from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush, QPen
 
 from app_common import show_about_dialog, load_about_info, AppInfoBar
 from app_common.log import get_logger
@@ -114,8 +114,20 @@ from app_common.exif_io import (
     extract_metadata_with_xmp_priority,
 )
 from app_common.file_browser import DirectoryBrowserWidget, FileListPanel
-from app_common.focus_calc import extract_focus_box, resolve_focus_camera_type_from_metadata
-from app_common.preview_canvas import PreviewCanvas, PreviewOverlayOptions, PreviewOverlayState
+from app_common.focus_calc import (
+    extract_focus_box,
+    resolve_focus_camera_type_from_metadata,
+    resolve_focus_display_orientation,
+)
+from app_common.preview_canvas import (
+    PREVIEW_COMPOSITION_GRID_LINE_WIDTHS,
+    PREVIEW_COMPOSITION_GRID_MODES,
+    PreviewCanvas,
+    PreviewOverlayOptions,
+    PreviewOverlayState,
+    normalize_preview_composition_grid_line_width,
+    normalize_preview_composition_grid_mode,
+)
 from app_common.report_db import PHOTO_COLUMNS, find_report_root, ReportDB
 from app_common.send_to_app import (
     ensure_file_open_aware_application,
@@ -138,6 +150,38 @@ from app_common.superviewer_user_options import (
     reload_runtime_user_options,
     apply_runtime_user_options,
 )
+
+PREVIEW_GRID_MODE_ITEMS = (
+    ("none", "构图线：不显示"),
+    ("thirds", "构图线：均分九宫格"),
+    ("golden_thirds", "构图线：黄金分割九宫格"),
+    ("square", "构图线：方格网格"),
+    ("diag_square", "构图线：对角线 + 方格"),
+    ("crosshair", "构图线：中心十字线"),
+)
+PREVIEW_GRID_MODE_COMBO_WIDTH = 190
+PREVIEW_GRID_LINE_WIDTH_COMBO_WIDTH = 120
+
+
+def _build_preview_grid_line_width_icon(width: int) -> QIcon:
+    """生成线宽预览图标，便于在下拉框里直观看到粗细。"""
+    line_width = normalize_preview_composition_grid_line_width(width)
+    pixmap = QPixmap(56, 16)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    except Exception:
+        pass
+    pen = QPen(QColor(0, 0, 0, 112))
+    pen.setWidth(line_width)
+    if hasattr(pen, "setCosmetic"):
+        pen.setCosmetic(True)
+    painter.setPen(pen)
+    y = pixmap.height() / 2.0
+    painter.drawLine(6, int(round(y)), pixmap.width() - 6, int(round(y)))
+    painter.end()
+    return QIcon(pixmap)
 
 # PyQt5/6 枚举兼容
 if hasattr(Qt, "AlignmentFlag"):
@@ -1851,6 +1895,34 @@ def save_tag_label_chinese_to_settings(use_chinese: bool):
     _save_settings(data)
 
 
+def load_preview_grid_mode_from_settings() -> str:
+    """读取预览区构图辅助线模式。"""
+    data = _load_settings()
+    return normalize_preview_composition_grid_mode(data.get("preview_grid_mode", "none"))
+
+
+def save_preview_grid_mode_to_settings(mode: str | None) -> None:
+    """保存预览区构图辅助线模式。"""
+    normalized = normalize_preview_composition_grid_mode(mode)
+    data = _load_settings()
+    data["preview_grid_mode"] = normalized
+    _save_settings(data)
+
+
+def load_preview_grid_line_width_from_settings() -> int:
+    """读取预览区构图辅助线线宽。"""
+    data = _load_settings()
+    return normalize_preview_composition_grid_line_width(data.get("preview_grid_line_width", 1))
+
+
+def save_preview_grid_line_width_to_settings(width: int | str | None) -> None:
+    """保存预览区构图辅助线线宽。"""
+    normalized = normalize_preview_composition_grid_line_width(width)
+    data = _load_settings()
+    data["preview_grid_line_width"] = normalized
+    _save_settings(data)
+
+
 def load_hyperfocal_coc_mm_from_settings() -> float:
     """读取超焦距计算的默认弥散圆（mm），缺省 0.03。"""
     data = _load_settings()
@@ -2470,12 +2542,36 @@ def _focus_box_from_center_and_span(
     return (left, top, right, bottom)
 
 
+def _resolve_focus_display_orientation_for_path(
+    path: str,
+    raw_metadata: dict | None = None,
+    *,
+    camera_type=None,
+) -> int:
+    """
+    为“显示对焦点”解析预览显示方向。
+
+    注意：HEIF/HIF 可能没有标准 EXIF Orientation，但厂商私有字段仍会标记竖拍。
+    因此焦点框路径要优先使用合并后的 metadata resolver，只有拿不到时才回退旧文件读取逻辑。
+    """
+    metadata = raw_metadata if isinstance(raw_metadata, dict) and raw_metadata else _load_focus_metadata_for_path(path)
+    if isinstance(metadata, dict) and metadata:
+        return resolve_focus_display_orientation(metadata, camera_type=camera_type)
+    return _get_orientation_from_file(path)
+
+
 def _load_focus_box_from_report_db(
-    path: str, width: int, height: int, ref_size: tuple[int, int] | None = None
+    path: str,
+    width: int,
+    height: int,
+    ref_size: tuple[int, int] | None = None,
+    raw_metadata: dict | None = None,
+    camera_type=None,
 ) -> tuple[float, float, float, float] | None:
     """
     从 report.db 的 focus_x、focus_y 构造焦点框（保底），框大小 128×128 像素。
     归一化时使用传入的 width/height 作为坐标系。
+    焦点框显示方向仍要走 metadata-aware resolver，避免竖拍 HIF/HEIF 按横图显示。
     """
     if width <= 0 or height <= 0:
         return None
@@ -2512,14 +2608,19 @@ def _load_focus_box_from_report_db(
         span_x = 128.0 / ref_w
         span_y = 128.0 / ref_h
         box = _focus_box_from_center_and_span(cx, cy, span_x, span_y)
-        orientation = _get_orientation_from_file(path)
+        orientation = _resolve_focus_display_orientation_for_path(
+            path,
+            raw_metadata,
+            camera_type=camera_type,
+        )
         _log.info(
-            "[_load_focus_box_from_report_db] path=%r focus=(%s,%s) ref_size=%sx%s box=%r",
+            "[_load_focus_box_from_report_db] path=%r focus=(%s,%s) ref_size=%sx%s orientation=%s box=%r",
             path,
             fx,
             fy,
             int(ref_w),
             int(ref_h),
+            orientation,
             box,
         )
         return _transform_focus_box_by_orientation(box, orientation)
@@ -2557,7 +2658,14 @@ def _load_focus_box_for_preview(path: str, width: int, height: int, *, allow_rep
         )
         if focus_box is None:
             if allow_report_db_fallback:
-                focus_box = _load_focus_box_from_report_db(path, width, height, ref_size=(focus_width, focus_height))
+                focus_box = _load_focus_box_from_report_db(
+                    path,
+                    width,
+                    height,
+                    ref_size=(focus_width, focus_height),
+                    raw_metadata=raw_metadata,
+                    camera_type=camera_type,
+                )
                 if focus_box is not None:
                     _log.info(
                         "[_load_focus_box_for_preview] fallback report_db path=%r focus_box=%r",
@@ -2573,21 +2681,33 @@ def _load_focus_box_for_preview(path: str, width: int, height: int, *, allow_rep
                 focus_height,
             )
             return None
-        orientation = _get_orientation_from_file(path)
+        orientation = _resolve_focus_display_orientation_for_path(
+            path,
+            raw_metadata,
+            camera_type=camera_type,
+        )
         mapped_box = _transform_focus_box_by_orientation(focus_box, orientation)
         _log.info(
-            "[_load_focus_box_for_preview] path=%r camera_type=%s calc_size=%sx%s focus_box=%r",
+            "[_load_focus_box_for_preview] path=%r camera_type=%s calc_size=%sx%s orientation=%s focus_box=%r",
             path,
             str(getattr(camera_type, "value", camera_type)),
             focus_width,
             focus_height,
+            orientation,
             mapped_box,
         )
         return mapped_box
     except Exception:
         _log.exception("[_load_focus_box_for_preview] failed path=%r", path)
         if allow_report_db_fallback:
-            focus_box = _load_focus_box_from_report_db(path, width, height, ref_size=(focus_width, focus_height))
+            focus_box = _load_focus_box_from_report_db(
+                path,
+                width,
+                height,
+                ref_size=(focus_width, focus_height),
+                raw_metadata=raw_metadata,
+                camera_type=camera_type,
+            )
             if focus_box is not None:
                 _log.info("[_load_focus_box_for_preview] fallback report_db after exception path=%r", path)
             return focus_box
@@ -2819,6 +2939,9 @@ class PreviewPanel(QWidget):
         self.setMinimumSize(320, 240)
         self.setAcceptDrops(True)
         self._current_path = None
+        self._show_focus_enabled = True
+        self._composition_grid_mode = normalize_preview_composition_grid_mode("none")
+        self._composition_grid_line_width = normalize_preview_composition_grid_line_width(1)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -2854,10 +2977,19 @@ class PreviewPanel(QWidget):
         self._canvas.apply_overlay_state(PreviewOverlayState(focus_box=focus_box))
 
     def set_show_focus_enabled(self, enabled: bool):
-        self._canvas.apply_overlay_options(
-            PreviewOverlayOptions(show_focus_box=bool(enabled))
-        )
-        self._canvas.update()
+        self._show_focus_enabled = bool(enabled)
+        self._apply_overlay_options()
+
+    def set_composition_grid_mode(self, mode: str | None) -> None:
+        self._composition_grid_mode = normalize_preview_composition_grid_mode(mode)
+        self._apply_overlay_options()
+
+    def set_composition_grid_line_width(self, width: int | str | None) -> None:
+        self._composition_grid_line_width = normalize_preview_composition_grid_line_width(width)
+        self._apply_overlay_options()
+
+    def composition_grid_mode(self) -> str:
+        return self._composition_grid_mode
 
     def get_preview_image_size(self):
         pix = getattr(self._canvas, "_source_pixmap", None)
@@ -2873,6 +3005,16 @@ class PreviewPanel(QWidget):
 
     def current_path(self):
         return self._current_path
+
+    def _apply_overlay_options(self) -> None:
+        self._canvas.apply_overlay_options(
+            PreviewOverlayOptions(
+                show_focus_box=self._show_focus_enabled,
+                composition_grid_mode=self._composition_grid_mode,
+                composition_grid_line_width=self._composition_grid_line_width,
+            )
+        )
+        self._canvas.update()
 
     def mousePressEvent(self, event):
         if event.button() == _LeftButton:
@@ -3343,12 +3485,57 @@ class MainWindow(QMainWindow):
         self.file_label.setStyleSheet("color: #aaa; font-size: 12px;")
         self.file_label.setWordWrap(True)
         left_layout.addWidget(self.file_label)
+        overlay_row = QHBoxLayout()
+        overlay_row.setContentsMargins(0, 0, 0, 0)
+        overlay_row.setSpacing(8)
         self.check_show_focus = QCheckBox("显示对焦点")
         self.check_show_focus.setChecked(True)
         self.check_show_focus.toggled.connect(self._on_preview_overlay_toggled)
-        left_layout.addWidget(self.check_show_focus)
+        overlay_row.addWidget(self.check_show_focus)
+        self.combo_preview_grid = QComboBox(self)
+        self.combo_preview_grid.setFixedWidth(PREVIEW_GRID_MODE_COMBO_WIDTH)
+        valid_preview_grid_modes = set(PREVIEW_COMPOSITION_GRID_MODES)
+        for mode, label in PREVIEW_GRID_MODE_ITEMS:
+            if mode in valid_preview_grid_modes:
+                self.combo_preview_grid.addItem(label, mode)
+        current_grid_mode = load_preview_grid_mode_from_settings()
+        current_index = self.combo_preview_grid.findData(current_grid_mode)
+        if current_index < 0:
+            current_index = self.combo_preview_grid.findData("none")
+        if current_index < 0 and self.combo_preview_grid.count() > 0:
+            current_index = 0
+        if current_index >= 0:
+            self.combo_preview_grid.setCurrentIndex(current_index)
+        self.combo_preview_grid.setToolTip("设置预览图上的构图辅助线，可选均分九宫格、黄金分割、方格、对角线等。")
+        self.combo_preview_grid.currentIndexChanged.connect(self._on_preview_grid_mode_changed)
+        overlay_row.addWidget(self.combo_preview_grid)
+        self.combo_preview_grid_line_width = QComboBox(self)
+        self.combo_preview_grid_line_width.setFixedWidth(PREVIEW_GRID_LINE_WIDTH_COMBO_WIDTH)
+        valid_preview_grid_line_widths = set(PREVIEW_COMPOSITION_GRID_LINE_WIDTHS)
+        for line_width in PREVIEW_COMPOSITION_GRID_LINE_WIDTHS:
+            if line_width in valid_preview_grid_line_widths:
+                self.combo_preview_grid_line_width.addItem(
+                    _build_preview_grid_line_width_icon(line_width),
+                    f"{line_width} px",
+                    line_width,
+                )
+        current_line_width = load_preview_grid_line_width_from_settings()
+        current_width_index = self.combo_preview_grid_line_width.findData(current_line_width)
+        if current_width_index < 0:
+            current_width_index = self.combo_preview_grid_line_width.findData(1)
+        if current_width_index < 0 and self.combo_preview_grid_line_width.count() > 0:
+            current_width_index = 0
+        if current_width_index >= 0:
+            self.combo_preview_grid_line_width.setCurrentIndex(current_width_index)
+        self.combo_preview_grid_line_width.setToolTip("设置构图辅助线线宽，列表图标按 1 到 4 像素直观显示粗细。")
+        self.combo_preview_grid_line_width.currentIndexChanged.connect(self._on_preview_grid_line_width_changed)
+        overlay_row.addWidget(self.combo_preview_grid_line_width)
+        overlay_row.addStretch(1)
+        left_layout.addLayout(overlay_row)
         self.preview_panel = PreviewPanel(central)
         self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
+        self.preview_panel.set_composition_grid_mode(self.combo_preview_grid.currentData())
+        self.preview_panel.set_composition_grid_line_width(self.combo_preview_grid_line_width.currentData())
         left_layout.addWidget(self.preview_panel, stretch=1)
         splitter.addWidget(left_widget)
 
@@ -3576,6 +3763,22 @@ class MainWindow(QMainWindow):
 
     def _on_preview_overlay_toggled(self, _checked: bool) -> None:
         self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
+
+    def _on_preview_grid_mode_changed(self, index: int) -> None:
+        mode = self.combo_preview_grid.itemData(index)
+        if mode is None:
+            mode = self.combo_preview_grid.currentData()
+        normalized = normalize_preview_composition_grid_mode(mode)
+        self.preview_panel.set_composition_grid_mode(normalized)
+        save_preview_grid_mode_to_settings(normalized)
+
+    def _on_preview_grid_line_width_changed(self, index: int) -> None:
+        width = self.combo_preview_grid_line_width.itemData(index)
+        if width is None:
+            width = self.combo_preview_grid_line_width.currentData()
+        normalized = normalize_preview_composition_grid_line_width(width)
+        self.preview_panel.set_composition_grid_line_width(normalized)
+        save_preview_grid_line_width_to_settings(normalized)
 
     def _on_exif_filter_changed(self, text: str):
         self.exif_table.set_filter_text(text)
