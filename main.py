@@ -131,6 +131,7 @@ from app_common.superviewer_user_options import (
     KEY_NAVIGATION_FPS_OPTIONS,
     get_user_options_path,
     get_runtime_user_options,
+    get_keep_view_on_switch,
     save_user_options,
     reload_runtime_user_options,
     apply_runtime_user_options,
@@ -485,6 +486,14 @@ class SuperViewerUserOptionsDialog(QDialog):
         grid.addWidget(self._combo_key_navigation_fps, row, 1)
         grid.addWidget(QLabel("默认 24 FPS"), row, 2)
 
+        row += 1
+        grid.addWidget(QLabel("切图时保持缩放/位置"), row, 0)
+        self._chk_keep_view = QCheckBox(self)
+        self._chk_keep_view.setChecked(bool(opts.get("keep_view_on_switch", 1)))
+        self._chk_keep_view.setToolTip("方向键切图时保持当前缩放比例和视图中心（不自动复位为适窗）。")
+        grid.addWidget(self._chk_keep_view, row, 1)
+        grid.addWidget(QLabel("默认开启"), row, 2)
+
         layout.addLayout(grid)
 
         note = QLabel("缩略视图会根据当前缩略图大小自动匹配最合适的一档预览图。")
@@ -510,6 +519,7 @@ class SuperViewerUserOptionsDialog(QDialog):
             "persistent_thumb_workers": int(self._spin_persistent_thumb_workers.value()),
             "persistent_thumb_max_size": int(self._combo_persistent_thumb_size.currentData()),
             "key_navigation_fps": int(self._combo_key_navigation_fps.currentData()),
+            "keep_view_on_switch": int(self._chk_keep_view.isChecked()),
         }
 
 
@@ -2811,7 +2821,7 @@ class PreviewPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         self._canvas = PreviewCanvas(self, placeholder_text="将图片拖入或点击选择")
-        self._canvas.set_keep_view_on_switch(True)
+        self._canvas.set_keep_view_on_switch(get_keep_view_on_switch())
         layout.addWidget(self._canvas, stretch=1)
         self._preview_status_label = QLabel("当前预览分辨率: -")
         self._preview_status_label.setStyleSheet("color: #aaa; font-size: 12px;")
@@ -2834,6 +2844,9 @@ class PreviewPanel(QWidget):
         self._current_path = None
         self._canvas.set_source_pixmap(None)
         self._set_preview_status_text(None, None)
+
+    def set_keep_view_on_switch(self, enabled: bool) -> None:
+        self._canvas.set_keep_view_on_switch(enabled)
 
     def set_focus_box(self, focus_box):
         self._canvas.apply_overlay_state(PreviewOverlayState(focus_box=focus_box))
@@ -3525,6 +3538,9 @@ class MainWindow(QMainWindow):
             return
         apply_runtime_user_options(normalized)
         self._file_list.apply_user_options()
+        self.preview_panel.set_keep_view_on_switch(
+            bool(normalized.get("keep_view_on_switch", 1))
+        )
         QMessageBox.information(
             self,
             "已保存",
