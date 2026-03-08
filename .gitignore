@@ -204,3 +204,4 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .last_folder.txt
+last_selected_directory.txt
