@@ -12,6 +12,8 @@ import shutil
 import re
 import subprocess
 import tempfile
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -100,7 +102,7 @@ except ImportError:
     from PyQt5.QtCore import Qt, QMimeData, QSize, QDir, QThread, QTimer, pyqtSignal, QModelIndex, QRect
     from PyQt5.QtGui import QPixmap, QImage, QTransform, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor, QAction, QIcon, QPainter, QBrush, QPen
 
-from app_common import show_about_dialog, load_about_info, AppInfoBar
+from app_common import show_about_dialog, load_about_images, load_about_info, AppInfoBar
 from app_common.log import get_logger
 from app_common.exif_io import (
     get_exiftool_executable_path,
@@ -161,6 +163,71 @@ PREVIEW_GRID_MODE_ITEMS = (
 )
 PREVIEW_GRID_MODE_COMBO_WIDTH = 190
 PREVIEW_GRID_LINE_WIDTH_COMBO_WIDTH = 120
+PHOTO_PREVIEW_MEMORY_CACHE_LIMIT = 2048
+PHOTO_PREVIEW_FOCUS_SIZE_VARIANT_LIMIT = 4
+FOCUS_PRELOAD_BATCH_SIZE = 12
+FOCUS_PRELOAD_CANONICAL_SIZE = (0, 0)
+FOCUS_CACHE_STATUS_UNKNOWN = "unknown"
+FOCUS_CACHE_STATUS_LOADING = "loading"
+FOCUS_CACHE_STATUS_READY = "ready"
+FOCUS_CACHE_STATUS_MISS = "miss"
+
+
+@dataclass(slots=True)
+class PhotoFocusMemoryCacheState:
+    """
+    单张照片在某一种预览图像尺寸下的焦点缓存。
+
+    这里按预览图像像素尺寸分桶，而不是只按文件路径缓存，
+    是为了兼容 report.db 保底路径在拿不到原始宽高时仍可能依赖当前预览尺寸。
+    以后如果新增别的尺寸相关 overlay，也沿着这个结构扩展。
+    """
+
+    status: str = FOCUS_CACHE_STATUS_UNKNOWN
+    focus_box: tuple[float, float, float, float] | None = None
+    used_path: str = ""
+    request_id: int = 0
+    size_independent: bool = False
+
+
+@dataclass(slots=True)
+class PhotoPreviewMemoryEntry:
+    """
+    单张照片的预览期内内存缓存。
+
+    焦点、构图辅助线、检测框等和“当前预览体验”强相关的内存态，
+    统一收敛到这里，避免未来把缓存散落成多个平行 dict。
+    这样后续 AI Coding 工具扩展新 overlay 时，只需要沿着这个 entry 加字段。
+    """
+
+    source_path: str
+    preview_path: str = ""
+    focus_source_path: str = ""
+    focus_states_by_preview_size: "OrderedDict[tuple[int, int], PhotoFocusMemoryCacheState]" = field(
+        default_factory=OrderedDict
+    )
+
+    def get_or_create_focus_state(self, size: tuple[int, int]) -> PhotoFocusMemoryCacheState:
+        size_key = (max(0, int(size[0])), max(0, int(size[1])))
+        state = self.focus_states_by_preview_size.get(size_key)
+        if state is None:
+            state = PhotoFocusMemoryCacheState()
+            self.focus_states_by_preview_size[size_key] = state
+        else:
+            self.focus_states_by_preview_size.move_to_end(size_key)
+        while len(self.focus_states_by_preview_size) > PHOTO_PREVIEW_FOCUS_SIZE_VARIANT_LIMIT:
+            self.focus_states_by_preview_size.popitem(last=False)
+        return state
+
+    def find_reusable_focus_state(self) -> PhotoFocusMemoryCacheState | None:
+        for size_key, state in reversed(list(self.focus_states_by_preview_size.items())):
+            if not state.size_independent:
+                continue
+            if state.status not in (FOCUS_CACHE_STATUS_READY, FOCUS_CACHE_STATUS_MISS):
+                continue
+            self.focus_states_by_preview_size.move_to_end(size_key)
+            return state
+        return None
 
 
 def _build_preview_grid_line_width_icon(width: int) -> QIcon:
@@ -371,16 +438,38 @@ def _get_app_icon_path() -> str | None:
 
 LAST_SELECTED_DIRECTORY_FILENAME = "last_selected_directory.txt"
 LEGACY_LAST_FOLDER_FILENAME = ".last_folder.txt"
+USER_STATE_DIRNAME = "SuperViewer"
+
+
+def _get_user_state_dir() -> str:
+    """
+    返回存放用户级状态文件的目录。
+
+    这里不要落到 build/app 目录，避免打包产物被清理后把上次打开目录一起删掉。
+    Windows 优先用 `%APPDATA%`，macOS 用 `~/Library/Application Support`，
+    其他平台回退到用户 home 下的隐藏目录。
+    """
+    if sys.platform.startswith("win"):
+        base_dir = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base_dir, USER_STATE_DIRNAME)
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", USER_STATE_DIRNAME)
+    return os.path.join(os.path.expanduser("~"), f".{USER_STATE_DIRNAME.lower()}")
 
 
 def _get_last_selected_directory_file_path() -> str:
-    """返回与 app exe 同目录的 .last_folder.txt 的完整路径。"""
-    return os.path.join(_get_app_dir(), LAST_SELECTED_DIRECTORY_FILENAME)
+    """返回用户目录下的 last_selected_directory.txt 完整路径。"""
+    return os.path.join(_get_user_state_dir(), LAST_SELECTED_DIRECTORY_FILENAME)
 
 
 def _get_legacy_last_folder_file_path() -> str:
-    """兼容旧版 .last_folder.txt。"""
+    """兼容旧版程序目录下的 .last_folder.txt。"""
     return os.path.join(_get_app_dir(), LEGACY_LAST_FOLDER_FILENAME)
+
+
+def _get_legacy_last_selected_directory_file_path() -> str:
+    """兼容旧版程序目录下的 last_selected_directory.txt。"""
+    return os.path.join(_get_app_dir(), LAST_SELECTED_DIRECTORY_FILENAME)
 
 
 def _read_last_selected_directory_file(path: str) -> str | None:
@@ -400,19 +489,23 @@ def _read_last_selected_directory_file(path: str) -> str | None:
 
 
 def load_last_folder_from_file() -> str | None:
-    """从 .last_folder.txt 读取上次打开的目录；文件不存在或路径无效时返回 None。"""
+    """读取上次打开的目录；优先读用户目录，兼容旧版程序目录文件。"""
     path = _read_last_selected_directory_file(_get_last_selected_directory_file_path())
+    if path:
+        return path
+    path = _read_last_selected_directory_file(_get_legacy_last_selected_directory_file_path())
     if path:
         return path
     return _read_last_selected_directory_file(_get_legacy_last_folder_file_path())
 
 
 def save_last_folder_to_file(path: str) -> None:
-    """将上次打开的目录写入 .last_folder.txt（与 app exe 同目录）。"""
+    """将上次打开的目录写入用户目录下的 last_selected_directory.txt。"""
     if not path or not os.path.isdir(path):
         return
     try:
         file_path = _get_last_selected_directory_file_path()
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(os.path.abspath(path))
     except Exception:
@@ -423,6 +516,11 @@ def _get_config_path() -> str:
     """返回 super_viewer.cfg 的完整路径，与当前运行的主程序同目录。"""
     app_dir = _get_app_dir()
     return os.path.join(app_dir, CONFIG_FILENAME)
+
+
+def _get_config_resource_path() -> str:
+    """返回可读取的 super_viewer.cfg 路径，打包后优先使用资源目录内的配置。"""
+    return _get_resource_path(CONFIG_FILENAME) or _get_config_path()
 
 
 def _load_settings() -> dict:
@@ -533,10 +631,10 @@ class SuperViewerUserOptionsDialog(QDialog):
         grid.addWidget(QLabel("默认 24 FPS"), row, 2)
 
         row += 1
-        grid.addWidget(QLabel("切图时保持缩放/位置"), row, 0)
+        grid.addWidget(QLabel("预览图更换时保持缩放/位置"), row, 0)
         self._chk_keep_view = QCheckBox(self)
         self._chk_keep_view.setChecked(bool(opts.get("keep_view_on_switch", 1)))
-        self._chk_keep_view.setToolTip("方向键切图时保持当前缩放比例和视图中心（不自动复位为适窗）。")
+        self._chk_keep_view.setToolTip("预览图更换时保持当前缩放比例和视图中心（不自动复位为适窗）。")
         grid.addWidget(self._chk_keep_view, row, 1)
         grid.addWidget(QLabel("默认开启"), row, 2)
 
@@ -2714,40 +2812,77 @@ def _load_focus_box_for_preview(path: str, width: int, height: int, *, allow_rep
         return None
 
 
-def _resolve_focus_report_fallback_ref_size(path: str, fallback: tuple[int, int]) -> tuple[int, int]:
+def _resolve_focus_report_fallback_ref_size(path: str, fallback: tuple[int, int]) -> tuple[tuple[int, int], bool]:
     raw_metadata = _load_focus_metadata_for_path(path)
     if isinstance(raw_metadata, dict) and raw_metadata:
-        return _resolve_focus_calc_image_size(raw_metadata, fallback=fallback)
+        return _resolve_focus_calc_image_size(raw_metadata, fallback=fallback), True
     fw = int(fallback[0]) if fallback and len(fallback) > 0 else 0
     fh = int(fallback[1]) if fallback and len(fallback) > 1 else 0
     if fw > 0 and fh > 0:
-        return (fw, fh)
-    return (1, 1)
+        return (fw, fh), False
+    return (1, 1), False
 
 
 class FocusBoxLoader(QThread):
     focus_loaded = pyqtSignal(int, object, str)  # (request_id, focus_box_or_none, used_path)
 
-    def __init__(self, request_id: int, preview_path: str, source_path: str, width: int, height: int, parent=None):
+    def __init__(
+        self,
+        request_id: int,
+        photo_cache_key: str,
+        preview_path: str,
+        source_path: str,
+        width: int,
+        height: int,
+        parent=None,
+    ):
         super().__init__(parent)
         self._request_id = int(request_id)
+        self._photo_cache_key = str(photo_cache_key or "")
         self._preview_path = os.path.normpath(preview_path) if preview_path else ""
         self._source_path = os.path.normpath(source_path) if source_path else ""
         self._width = int(width)
         self._height = int(height)
+        self._result_size_independent = False
+
+    @property
+    def request_id(self) -> int:
+        return self._request_id
+
+    @property
+    def photo_cache_key(self) -> str:
+        return self._photo_cache_key
+
+    @property
+    def preview_size_key(self) -> tuple[int, int]:
+        return (self._width, self._height)
+
+    @property
+    def result_size_independent(self) -> bool:
+        return self._result_size_independent
 
     def run(self) -> None:
         candidates: list[tuple[str, str]] = []
-        if self._preview_path and os.path.isfile(self._preview_path):
-            candidates.append(("preview", self._preview_path))
         if self._source_path and os.path.isfile(self._source_path):
-            same_as_preview = (
-                self._preview_path
+            candidates.append(("source", self._source_path))
+        if self._preview_path and os.path.isfile(self._preview_path):
+            same_as_source = (
+                self._source_path
                 and os.path.normcase(self._preview_path) == os.path.normcase(self._source_path)
             )
-            if not same_as_preview:
-                candidates.append(("source", self._source_path))
+            if not same_as_source:
+                candidates.append(("preview", self._preview_path))
 
+        # 焦点元数据通常在源文件而不在 temp/thumbnail JPEG，上面优先 source 可以减少长按方向键时的等待。
+        seen_candidate_paths: set[str] = set()
+        deduped_candidates: list[tuple[str, str]] = []
+        for label, candidate_path in candidates:
+            norm_candidate = os.path.normcase(candidate_path)
+            if not candidate_path or norm_candidate in seen_candidate_paths:
+                continue
+            seen_candidate_paths.add(norm_candidate)
+            deduped_candidates.append((label, candidate_path))
+        candidates = deduped_candidates
         _log.info(
             "[FocusBoxLoader.run] START request_id=%s preview=%r source=%r candidates=%s",
             self._request_id,
@@ -2773,13 +2908,14 @@ class FocusBoxLoader(QThread):
                 focus_box,
             )
             if focus_box:
+                self._result_size_independent = True
                 self.focus_loaded.emit(self._request_id, focus_box, candidate_path)
                 return
 
         fallback_used_path = self._source_path or self._preview_path
         fallback_box = None
         if fallback_used_path and os.path.isfile(fallback_used_path):
-            fallback_ref_size = _resolve_focus_report_fallback_ref_size(
+            fallback_ref_size, fallback_size_independent = _resolve_focus_report_fallback_ref_size(
                 fallback_used_path,
                 fallback=(self._width, self._height),
             )
@@ -2796,7 +2932,66 @@ class FocusBoxLoader(QThread):
                 fallback_ref_size,
                 fallback_box,
             )
+            self._result_size_independent = bool(fallback_size_independent)
         self.focus_loaded.emit(self._request_id, fallback_box, fallback_used_path)
+
+
+class FocusCachePreloadWorker(QThread):
+    focus_batch_ready = pyqtSignal(int, object)  # (token, list[(source_path, focus_box, used_path)])
+
+    def __init__(self, token: int, tasks: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self._token = int(token)
+        self._tasks = [
+            (
+                os.path.normpath(source_path) if source_path else "",
+                os.path.normpath(load_path) if load_path else "",
+            )
+            for source_path, load_path in (tasks or [])
+        ]
+
+    @property
+    def token(self) -> int:
+        return self._token
+
+    def run(self) -> None:
+        batch: list[tuple[str, tuple[float, float, float, float], str]] = []
+        _log.info("[FocusCachePreloadWorker.run] START token=%s tasks=%s", self._token, len(self._tasks))
+        for source_path, load_path in self._tasks:
+            if self.isInterruptionRequested():
+                _log.info("[FocusCachePreloadWorker.run] interrupted token=%s", self._token)
+                return
+            if not source_path or not load_path or not os.path.isfile(load_path):
+                continue
+            try:
+                focus_box = _load_focus_box_for_preview(
+                    load_path,
+                    1,
+                    1,
+                    allow_report_db_fallback=False,
+                )
+            except Exception:
+                _log.exception("[FocusCachePreloadWorker.run] preload failed source=%r load=%r", source_path, load_path)
+                continue
+            if not focus_box:
+                continue
+            batch.append((source_path, focus_box, load_path))
+            if len(batch) >= FOCUS_PRELOAD_BATCH_SIZE:
+                _log.info(
+                    "[FocusCachePreloadWorker.run] emit token=%s batch=%s",
+                    self._token,
+                    len(batch),
+                )
+                self.focus_batch_ready.emit(self._token, list(batch))
+                batch.clear()
+        if batch:
+            _log.info(
+                "[FocusCachePreloadWorker.run] emit final token=%s batch=%s",
+                self._token,
+                len(batch),
+            )
+            self.focus_batch_ready.emit(self._token, list(batch))
+        _log.info("[FocusCachePreloadWorker.run] END token=%s", self._token)
 
 
 def _resolve_focus_calc_image_size(raw_metadata: dict, fallback: tuple[int, int]) -> tuple[int, int]:
@@ -3448,7 +3643,7 @@ class ExifTagOrderDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, initial_received_files=None):
         super().__init__()
-        info = load_about_info(_get_config_path())
+        info = load_about_info(_get_config_resource_path())
         product_name = _get_product_display_name(info)
         self.setWindowTitle(_build_main_window_title(info))
         self.setMinimumSize(900, 600)
@@ -3482,6 +3677,7 @@ class MainWindow(QMainWindow):
         # 连接文件列表选中 → 预览 + EXIF 刷新
         self._file_list.file_fast_preview_requested.connect(self._on_file_fast_preview_requested)
         self._file_list.file_selected.connect(self._on_file_selected_from_list)
+        self._file_list.focus_cache_batch_ready.connect(self._on_metadata_focus_cache_batch_ready)
 
         # ── 面板 3：App 信息 + 文件名 + 拖放预览区 ──
         left_widget = QWidget()
@@ -3539,7 +3735,7 @@ class MainWindow(QMainWindow):
         current_line_width = load_preview_grid_line_width_from_settings()
         current_width_index = self.combo_preview_grid_line_width.findData(current_line_width)
         if current_width_index < 0:
-            current_width_index = self.combo_preview_grid_line_width.findData(4)
+            current_width_index = self.combo_preview_grid_line_width.findData(1)
         if current_width_index < 0 and self.combo_preview_grid_line_width.count() > 0:
             current_width_index = 0
         if current_width_index >= 0:
@@ -3587,8 +3783,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
 
         self._current_exif_path = None
+        self._current_preview_source_path: str = ""
         self._focus_loader: FocusBoxLoader | None = None
-        self._focus_request_id: int = 0
+        self._focus_display_request_id: int = 0
+        self._focus_request_sequence: int = 0
+        self._focus_preload_worker: FocusCachePreloadWorker | None = None
+        self._focus_preload_token: int = 0
+        self._photo_preview_memory_cache: "OrderedDict[str, PhotoPreviewMemoryEntry]" = OrderedDict()
 
         # preview_panel 的 parent 为 central，回调挂在 left_widget 上供拖放/选图后调用
         left_widget.on_image_loaded = self.on_image_loaded
@@ -3623,10 +3824,240 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    @staticmethod
+    def _normalize_photo_preview_cache_key(path: str) -> str:
+        if not path:
+            return ""
+        try:
+            normalized = os.path.abspath(os.path.normpath(path))
+        except Exception:
+            normalized = os.path.normpath(path)
+        return os.path.normcase(normalized)
+
+    def _prune_photo_preview_memory_cache(self) -> None:
+        while len(self._photo_preview_memory_cache) > PHOTO_PREVIEW_MEMORY_CACHE_LIMIT:
+            self._photo_preview_memory_cache.popitem(last=False)
+
+    def _get_photo_preview_memory_entry(self, path: str, *, create: bool) -> PhotoPreviewMemoryEntry | None:
+        cache_key = self._normalize_photo_preview_cache_key(path)
+        if not cache_key:
+            return None
+        entry = self._photo_preview_memory_cache.get(cache_key)
+        if entry is None and create:
+            entry = PhotoPreviewMemoryEntry(source_path=os.path.abspath(os.path.normpath(path)))
+            self._photo_preview_memory_cache[cache_key] = entry
+            self._prune_photo_preview_memory_cache()
+            return entry
+        if entry is not None:
+            self._photo_preview_memory_cache.move_to_end(cache_key)
+        return entry
+
+    def _get_photo_focus_memory_state(
+        self,
+        path: str,
+        preview_path: str,
+        focus_source_path: str,
+        preview_size: tuple[int, int],
+        *,
+        create: bool,
+    ) -> tuple[str, tuple[int, int], PhotoPreviewMemoryEntry | None, PhotoFocusMemoryCacheState | None]:
+        cache_key = self._normalize_photo_preview_cache_key(path)
+        size_key = (max(0, int(preview_size[0])), max(0, int(preview_size[1])))
+        entry = self._get_photo_preview_memory_entry(path, create=create)
+        if entry is None:
+            return cache_key, size_key, None, None
+        if preview_path:
+            entry.preview_path = os.path.normpath(preview_path)
+        if focus_source_path:
+            entry.focus_source_path = os.path.normpath(focus_source_path)
+        if create:
+            return cache_key, size_key, entry, entry.get_or_create_focus_state(size_key)
+        state = entry.focus_states_by_preview_size.get(size_key)
+        if state is not None:
+            entry.focus_states_by_preview_size.move_to_end(size_key)
+        return cache_key, size_key, entry, state
+
+    def _reset_loading_focus_memory_state(self, loader: FocusBoxLoader) -> None:
+        cache_key = loader.photo_cache_key
+        if not cache_key:
+            return
+        entry = self._photo_preview_memory_cache.get(cache_key)
+        if entry is None:
+            return
+        state = entry.focus_states_by_preview_size.get(loader.preview_size_key)
+        if state is None:
+            return
+        if state.status != FOCUS_CACHE_STATUS_LOADING or state.request_id != loader.request_id:
+            return
+        state.status = FOCUS_CACHE_STATUS_UNKNOWN
+        state.focus_box = None
+        state.used_path = ""
+        state.request_id = 0
+        state.size_independent = False
+        entry.focus_states_by_preview_size.move_to_end(loader.preview_size_key)
+        self._photo_preview_memory_cache.move_to_end(cache_key)
+
+    def _apply_preview_overlay_options_to_preview(self) -> None:
+        """将预览 overlay 选项同步到 canvas，切图和高速浏览都复用这一入口。"""
+        self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
+        self.preview_panel.set_composition_grid_mode(self.combo_preview_grid.currentData())
+        self.preview_panel.set_composition_grid_line_width(self.combo_preview_grid_line_width.currentData())
+
+    def _set_current_preview_source_path(self, path: str) -> None:
+        self._current_preview_source_path = os.path.normpath(path) if path else ""
+
+    def _store_reusable_focus_cache_entry(
+        self,
+        source_path: str,
+        focus_box: tuple[float, float, float, float],
+        used_path: str,
+    ) -> None:
+        _, _, entry, state = self._get_photo_focus_memory_state(
+            source_path,
+            "",
+            used_path,
+            FOCUS_PRELOAD_CANONICAL_SIZE,
+            create=True,
+        )
+        if entry is None or state is None:
+            return
+        state.status = FOCUS_CACHE_STATUS_READY
+        state.focus_box = focus_box
+        state.used_path = os.path.normpath(used_path) if used_path else ""
+        state.request_id = 0
+        state.size_independent = True
+
+    def _on_metadata_focus_cache_batch_ready(self, batch: dict[str, dict]) -> None:
+        """
+        文件列表 metadata 批处理顺带带回来的焦点缓存。
+
+        这条链路只缓存“可由文件 metadata 直接算出”的结果；若当前预览正好命中，
+        立即回填 canvas，这样目录刚载入完时无需等用户逐张点开才有焦点。
+        """
+        if not isinstance(batch, dict) or not batch:
+            return
+        for source_path, payload in batch.items():
+            if not source_path or not isinstance(payload, dict):
+                continue
+            focus_box = payload.get("focus_box")
+            used_path = payload.get("used_path") or source_path
+            if not focus_box:
+                continue
+            self._store_reusable_focus_cache_entry(source_path, focus_box, used_path)
+        current_path = self._current_preview_source_path
+        if not current_path:
+            return
+        current_key = self._normalize_photo_preview_cache_key(current_path)
+        if any(self._normalize_photo_preview_cache_key(source_path) == current_key for source_path in batch):
+            self._update_preview_focus_box(current_path, allow_async_load=False)
+
+    def _build_focus_preload_tasks(
+        self,
+        paths: list[str],
+        *,
+        prioritize_path: str = "",
+    ) -> list[tuple[str, str]]:
+        prioritized_norm = os.path.normpath(prioritize_path) if prioritize_path else ""
+        available_path_keys = {
+            os.path.normcase(os.path.normpath(raw_path))
+            for raw_path in (paths or [])
+            if raw_path
+        }
+        ordered_paths: list[str] = []
+        seen_paths: set[str] = set()
+        if prioritized_norm and os.path.normcase(prioritized_norm) in available_path_keys:
+            ordered_paths.append(prioritized_norm)
+            seen_paths.add(os.path.normcase(prioritized_norm))
+        for raw_path in paths or []:
+            norm_path = os.path.normpath(raw_path) if raw_path else ""
+            if not norm_path:
+                continue
+            dedup_key = os.path.normcase(norm_path)
+            if dedup_key in seen_paths:
+                continue
+            seen_paths.add(dedup_key)
+            ordered_paths.append(norm_path)
+
+        tasks: list[tuple[str, str]] = []
+        for source_path in ordered_paths:
+            entry = self._get_photo_preview_memory_entry(source_path, create=False)
+            if entry is not None and entry.find_reusable_focus_state() is not None:
+                continue
+            load_path = self._resolve_focus_metadata_source_path(source_path) or source_path
+            if not load_path or not os.path.isfile(load_path):
+                continue
+            tasks.append((source_path, load_path))
+        return tasks
+
+    def _stop_focus_preload(self) -> None:
+        worker = self._focus_preload_worker
+        if worker is None:
+            return
+        try:
+            worker.focus_batch_ready.disconnect(self._on_focus_preload_batch_ready)
+        except Exception:
+            pass
+        try:
+            worker.finished.disconnect(self._on_focus_preload_finished)
+        except Exception:
+            pass
+        worker.requestInterruption()
+        self._focus_preload_worker = None
+
+    def _start_focus_preload(self, paths: list[str], *, prioritize_path: str = "") -> None:
+        tasks = self._build_focus_preload_tasks(paths, prioritize_path=prioritize_path)
+        self._stop_focus_preload()
+        if not tasks:
+            _log.info("[_start_focus_preload] skip: no uncached tasks prioritize=%r", prioritize_path)
+            return
+        self._focus_preload_token += 1
+        token = self._focus_preload_token
+        worker = FocusCachePreloadWorker(token, tasks, self)
+        worker.focus_batch_ready.connect(self._on_focus_preload_batch_ready)
+        worker.finished.connect(self._on_focus_preload_finished)
+        self._focus_preload_worker = worker
+        _log.info(
+            "[_start_focus_preload] token=%s tasks=%s prioritize=%r",
+            token,
+            len(tasks),
+            prioritize_path,
+        )
+        worker.start()
+
+    def _on_file_list_loaded_for_focus_preload(self, paths: list[str]) -> None:
+        self._start_focus_preload(paths, prioritize_path=self._current_preview_source_path)
+
+    def _on_focus_preload_batch_ready(self, token: int, batch: list[tuple[str, tuple[float, float, float, float], str]]) -> None:
+        if token != self._focus_preload_token:
+            _log.info(
+                "[_on_focus_preload_batch_ready] ignore stale token=%s current=%s batch=%s",
+                token,
+                self._focus_preload_token,
+                len(batch or []),
+            )
+            return
+        for source_path, focus_box, used_path in batch or []:
+            if not source_path or not focus_box:
+                continue
+            self._store_reusable_focus_cache_entry(source_path, focus_box, used_path)
+        current_path = self._current_preview_source_path
+        if current_path and batch:
+            current_key = self._normalize_photo_preview_cache_key(current_path)
+            if any(self._normalize_photo_preview_cache_key(source_path) == current_key for source_path, _box, _used_path in batch):
+                self._update_preview_focus_box(current_path, allow_async_load=False)
+
+    def _on_focus_preload_finished(self) -> None:
+        worker = self.sender()
+        if worker is None:
+            return
+        if self._focus_preload_worker is worker:
+            self._focus_preload_worker = None
+
     def _on_file_selected_from_list(self, path: str):
         """文件列表中选中图像文件，触发预览和 EXIF 加载（等同于拖放）。"""
         preview_path = self._file_list.resolve_preview_path(path)
         _log.info("[_on_file_selected_from_list] source=%r preview=%r", path, preview_path)
+        self._set_current_preview_source_path(path)
         self.preview_panel.set_image(preview_path)
         self.on_image_loaded(path)
 
@@ -3634,7 +4065,9 @@ class MainWindow(QMainWindow):
         """连续方向键长按时，优先用小缩略图刷新 PreviewCanvas。"""
         preview_path = self._file_list.resolve_preview_path(path, prefer_fast_preview=True)
         _log.info("[_on_file_fast_preview_requested] source=%r preview=%r", path, preview_path)
+        self._set_current_preview_source_path(path)
         self.preview_panel.set_image(preview_path)
+        self._update_preview_focus_box(path, allow_async_load=self.check_show_focus.isChecked())
 
     @staticmethod
     def _find_source_file_by_stem(path: str) -> str | None:
@@ -3694,7 +4127,7 @@ class MainWindow(QMainWindow):
 
     def _init_menu_bar(self):
         file_menu = self.menuBar().addMenu("文件")
-        extern_apps = get_external_apps(_get_app_dir())
+        extern_apps = get_external_apps()
         if extern_apps:
             send_menu = file_menu.addMenu("发送到外部应用")
             for app in extern_apps:
@@ -3729,7 +4162,7 @@ class MainWindow(QMainWindow):
             self.menuBar().clear()
             self._init_menu_bar()
 
-        show_external_apps_settings_dialog(self, config_dir=_get_app_dir(), on_saved=on_saved)
+        show_external_apps_settings_dialog(self, on_saved=on_saved)
 
     def _open_user_options_dialog(self) -> None:
         dialog = SuperViewerUserOptionsDialog(self, options=get_runtime_user_options())
@@ -3774,9 +4207,11 @@ class MainWindow(QMainWindow):
         self._dir_browser.select_directory(parent, emit_signal=True)
 
     def _show_about_dialog(self):
-        info = load_about_info(_get_config_path())
+        about_cfg_path = _get_config_resource_path()
+        info = load_about_info(about_cfg_path)
+        about_images = load_about_images(about_cfg_path)
         logo_path = _get_resource_path("icons/app_icon.png") or _get_app_icon_path()
-        show_about_dialog(self, info, logo_path=logo_path)
+        show_about_dialog(self, info, logo_path=logo_path, images=about_images)
 
     def _on_preview_overlay_toggled(self, _checked: bool) -> None:
         self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
@@ -3899,6 +4334,7 @@ class MainWindow(QMainWindow):
     def on_image_loaded(self, path: str):
         """图片被拖入或选择后调用。"""
         _log.info("[on_image_loaded] 选中照片 开始查询 EXIF path=%r", path)
+        self._set_current_preview_source_path(path)
         self._current_exif_path = path
         self.file_label.setText(path)
         self.file_label.setToolTip(path)
@@ -3913,28 +4349,128 @@ class MainWindow(QMainWindow):
             )
         self.exif_table.set_exif(rows)
 
-    def _update_preview_focus_box(self, path: str) -> None:
-        """根据当前预览图尺寸与元数据提取焦点框并更新到 PreviewCanvas。"""
-        self.preview_panel.set_focus_box(None)
+    def _update_preview_focus_box(self, path: str, *, allow_async_load: bool = True) -> None:
+        """
+        根据当前预览图尺寸与元数据更新 PreviewCanvas 的焦点框。
+
+        `allow_async_load=False` 时只命中内存缓存，不启动新的焦点提取线程，
+        这样方向键高 FPS 快速预览时不会被重复的元数据 I/O 拖慢。
+        """
         if not path or not os.path.isfile(path):
             self._stop_focus_loader()
-            self._apply_show_focus_to_preview()
+            self.preview_panel.set_focus_box(None)
+            self._apply_preview_overlay_options_to_preview()
             return
         size = self.preview_panel.get_preview_image_size()
         if not size:
             self._stop_focus_loader()
-            self._apply_show_focus_to_preview()
+            self.preview_panel.set_focus_box(None)
+            self._apply_preview_overlay_options_to_preview()
             return
         preview_path = self.preview_panel.current_path() or path
         focus_source_path = self._resolve_focus_metadata_source_path(path)
         if (not preview_path or not os.path.isfile(preview_path)) and (not focus_source_path or not os.path.isfile(focus_source_path)):
             self._stop_focus_loader()
             _log.info("[_update_preview_focus_box] skip: no usable path preview=%r focus_source=%r", preview_path, focus_source_path)
-            self._apply_show_focus_to_preview()
+            self.preview_panel.set_focus_box(None)
+            self._apply_preview_overlay_options_to_preview()
+            return
+        cache_key, size_key, _entry, focus_state = self._get_photo_focus_memory_state(
+            path,
+            preview_path,
+            focus_source_path,
+            size,
+            create=True,
+        )
+        reusable_focus_state = _entry.find_reusable_focus_state() if _entry is not None else None
+        if focus_state is not None and focus_state.status == FOCUS_CACHE_STATUS_READY:
+            self._stop_focus_loader()
+            _log.info(
+                "[_update_preview_focus_box] cache hit ready preview=%r focus_source=%r size=%sx%s used_path=%r",
+                preview_path,
+                focus_source_path,
+                size_key[0],
+                size_key[1],
+                focus_state.used_path,
+            )
+            self.preview_panel.set_focus_box(focus_state.focus_box)
+            self._apply_preview_overlay_options_to_preview()
+            return
+        if (
+            focus_state is not None
+            and reusable_focus_state is not None
+            and reusable_focus_state is not focus_state
+        ):
+            focus_state.status = reusable_focus_state.status
+            focus_state.focus_box = reusable_focus_state.focus_box
+            focus_state.used_path = reusable_focus_state.used_path
+            focus_state.request_id = reusable_focus_state.request_id
+            focus_state.size_independent = True
+            self._stop_focus_loader()
+            _log.info(
+                "[_update_preview_focus_box] cache hit shared preview=%r focus_source=%r size=%sx%s used_path=%r status=%s",
+                preview_path,
+                focus_source_path,
+                size_key[0],
+                size_key[1],
+                reusable_focus_state.used_path,
+                reusable_focus_state.status,
+            )
+            self.preview_panel.set_focus_box(focus_state.focus_box if focus_state.status == FOCUS_CACHE_STATUS_READY else None)
+            self._apply_preview_overlay_options_to_preview()
+            return
+        if focus_state is not None and focus_state.status == FOCUS_CACHE_STATUS_MISS:
+            self._stop_focus_loader()
+            _log.info(
+                "[_update_preview_focus_box] cache hit miss preview=%r focus_source=%r size=%sx%s",
+                preview_path,
+                focus_source_path,
+                size_key[0],
+                size_key[1],
+            )
+            self.preview_panel.set_focus_box(None)
+            self._apply_preview_overlay_options_to_preview()
+            return
+        active_loader = self._focus_loader
+        if isinstance(active_loader, FocusBoxLoader):
+            if active_loader.photo_cache_key == cache_key and active_loader.preview_size_key == size_key:
+                if focus_state is not None:
+                    focus_state.status = FOCUS_CACHE_STATUS_LOADING
+                    focus_state.request_id = active_loader.request_id
+                    focus_state.size_independent = False
+                _log.info(
+                    "[_update_preview_focus_box] reuse in-flight request_id=%s preview=%r focus_source=%r size=%sx%s",
+                    active_loader.request_id,
+                    preview_path,
+                    focus_source_path,
+                    size_key[0],
+                    size_key[1],
+                )
+                self.preview_panel.set_focus_box(None)
+                self._apply_preview_overlay_options_to_preview()
+                return
+        if not allow_async_load:
+            self._stop_focus_loader()
+            _log.info(
+                "[_update_preview_focus_box] cache cold skip async preview=%r focus_source=%r size=%sx%s",
+                preview_path,
+                focus_source_path,
+                size_key[0],
+                size_key[1],
+            )
+            self.preview_panel.set_focus_box(None)
+            self._apply_preview_overlay_options_to_preview()
             return
         self._stop_focus_loader()
-        self._focus_request_id += 1
-        request_id = self._focus_request_id
+        self._focus_request_sequence += 1
+        request_id = self._focus_request_sequence
+        self._focus_display_request_id = request_id
+        if focus_state is not None:
+            focus_state.status = FOCUS_CACHE_STATUS_LOADING
+            focus_state.focus_box = None
+            focus_state.used_path = ""
+            focus_state.request_id = request_id
+            focus_state.size_independent = False
         _log.info(
             "[_update_preview_focus_box] async request_id=%s preview=%r focus_source=%r size=%sx%s",
             request_id,
@@ -3943,16 +4479,26 @@ class MainWindow(QMainWindow):
             size[0],
             size[1],
         )
-        loader = FocusBoxLoader(request_id, preview_path, focus_source_path, size[0], size[1], self)
+        loader = FocusBoxLoader(
+            request_id,
+            cache_key,
+            preview_path,
+            focus_source_path,
+            size[0],
+            size[1],
+            self,
+        )
         loader.focus_loaded.connect(self._on_focus_box_loaded)
         self._focus_loader = loader
         loader.start()
-        self._apply_show_focus_to_preview()
+        self.preview_panel.set_focus_box(None)
+        self._apply_preview_overlay_options_to_preview()
 
     def _stop_focus_loader(self) -> None:
         loader = self._focus_loader
         if loader is None:
             return
+        self._reset_loading_focus_memory_state(loader)
         try:
             loader.focus_loaded.disconnect(self._on_focus_box_loaded)
         except Exception:
@@ -3961,15 +4507,25 @@ class MainWindow(QMainWindow):
         self._focus_loader = None
 
     def _on_focus_box_loaded(self, request_id: int, focus_box, used_path: str) -> None:
-        if request_id != self._focus_request_id:
+        loader = self.sender()
+        if isinstance(loader, FocusBoxLoader):
+            entry = self._photo_preview_memory_cache.get(loader.photo_cache_key)
+            if entry is not None:
+                state = entry.get_or_create_focus_state(loader.preview_size_key)
+                state.focus_box = focus_box
+                state.used_path = os.path.normpath(used_path) if used_path else ""
+                state.request_id = request_id
+                state.status = FOCUS_CACHE_STATUS_READY if focus_box else FOCUS_CACHE_STATUS_MISS
+                state.size_independent = loader.result_size_independent
+                self._photo_preview_memory_cache.move_to_end(loader.photo_cache_key)
+        if request_id != self._focus_display_request_id:
             _log.info(
                 "[_on_focus_box_loaded] ignore stale request_id=%s current=%s used_path=%r",
                 request_id,
-                self._focus_request_id,
+                self._focus_display_request_id,
                 used_path,
             )
             return
-        loader = self.sender()
         if isinstance(loader, FocusBoxLoader):
             try:
                 loader.focus_loaded.disconnect(self._on_focus_box_loaded)
@@ -3984,11 +4540,16 @@ class MainWindow(QMainWindow):
             focus_box,
         )
         self.preview_panel.set_focus_box(focus_box)
-        self._apply_show_focus_to_preview()
+        self._apply_preview_overlay_options_to_preview()
 
     def _apply_show_focus_to_preview(self) -> None:
         """将「显示对焦点」复选框状态同步到预览 canvas，确保选项生效。"""
-        self.preview_panel.set_show_focus_enabled(self.check_show_focus.isChecked())
+        self._apply_preview_overlay_options_to_preview()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._stop_focus_loader()
+        self._stop_focus_preload()
+        super().closeEvent(event)
 
 
 def main():
@@ -3998,7 +4559,7 @@ def main():
         if app_dir and os.path.isdir(app_dir):
             os.chdir(app_dir)
     reload_runtime_user_options()
-    about_info = load_about_info(_get_config_path())
+    about_info = load_about_info(_get_config_resource_path())
     app_name = _get_product_display_name(about_info)
     _apply_runtime_app_identity(app_name)
 
