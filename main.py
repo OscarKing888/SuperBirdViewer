@@ -3135,13 +3135,15 @@ class PreviewPanel(QWidget):
         self.setAcceptDrops(True)
         self._current_path = None
         self._show_focus_enabled = True
+        self._keep_view_on_switch = bool(get_keep_view_on_switch())
         self._composition_grid_mode = normalize_preview_composition_grid_mode("none")
         self._composition_grid_line_width = normalize_preview_composition_grid_line_width(1)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         self._canvas = PreviewCanvas(self, placeholder_text="将图片拖入或点击选择")
-        self._canvas.set_keep_view_on_switch(get_keep_view_on_switch())
+        if hasattr(self._canvas, "set_keep_view_on_switch"):
+            self._canvas.set_keep_view_on_switch(self._keep_view_on_switch)
         layout.addWidget(self._canvas, stretch=1)
         self._preview_status_label = QLabel("当前预览分辨率: -")
         self._preview_status_label.setStyleSheet("color: #aaa; font-size: 12px;")
@@ -3153,7 +3155,14 @@ class PreviewPanel(QWidget):
         self.set_focus_box(None)
         pix = _load_preview_pixmap_for_canvas(path)
         if pix is not None and not pix.isNull():
-            self._canvas.set_source_pixmap(pix, reset_view=True)
+            if self._keep_view_on_switch:
+                self._canvas.set_source_pixmap(
+                    pix,
+                    preserve_view=True,
+                    preserve_scale=True,
+                )
+            else:
+                self._canvas.set_source_pixmap(pix, reset_view=True)
             self._set_preview_status_text(pix.width(), pix.height())
         else:
             self._canvas.set_source_pixmap(None)
@@ -3166,7 +3175,9 @@ class PreviewPanel(QWidget):
         self._set_preview_status_text(None, None)
 
     def set_keep_view_on_switch(self, enabled: bool) -> None:
-        self._canvas.set_keep_view_on_switch(enabled)
+        self._keep_view_on_switch = bool(enabled)
+        if hasattr(self._canvas, "set_keep_view_on_switch"):
+            self._canvas.set_keep_view_on_switch(self._keep_view_on_switch)
 
     def set_focus_box(self, focus_box):
         self._canvas.apply_overlay_state(PreviewOverlayState(focus_box=focus_box))
@@ -3219,13 +3230,12 @@ class PreviewPanel(QWidget):
         return self._current_path
 
     def _apply_overlay_options(self) -> None:
-        self._canvas.apply_overlay_options(
-            PreviewOverlayOptions(
-                show_focus_box=self._show_focus_enabled,
-                composition_grid_mode=self._composition_grid_mode,
-                composition_grid_line_width=self._composition_grid_line_width,
-            )
-        )
+        options = PreviewOverlayOptions(show_focus_box=self._show_focus_enabled)
+        if hasattr(options, "composition_grid_mode"):
+            options.composition_grid_mode = self._composition_grid_mode
+        if hasattr(options, "composition_grid_line_width"):
+            options.composition_grid_line_width = self._composition_grid_line_width
+        self._canvas.apply_overlay_options(options)
         self._canvas.update()
 
     def mousePressEvent(self, event):
@@ -3809,6 +3819,25 @@ class MainWindow(QMainWindow):
         rows = merge_report_metadata_rows(rows, self._get_report_row_for_current_path(path))
         return rows
 
+    def _sync_report_metadata_after_save(self, path: str, meta_tag_id: str, value: str) -> None:
+        report_fields: dict[str, str] = {}
+        meta_updates: dict[str, str] = {}
+        if meta_tag_id == META_TITLE_TAG_ID:
+            report_fields["title"] = value
+            meta_updates["title"] = value
+        elif meta_tag_id == META_DESCRIPTION_TAG_ID:
+            report_fields["caption"] = value
+        if not report_fields and not meta_updates:
+            return
+        try:
+            self._file_list.sync_metadata_edit_for_path(
+                path,
+                report_fields=report_fields,
+                meta_updates=meta_updates,
+            )
+        except Exception:
+            _log.exception("[_sync_report_metadata_after_save] path=%r meta_tag_id=%r", path, meta_tag_id)
+
     def _on_directory_selected(self, path: str):
         """目录树选中目录后，保存路径到设置与 .last_folder.txt，并刷新文件列表。"""
         save_last_selected_directory_to_settings(path)
@@ -4287,6 +4316,7 @@ class MainWindow(QMainWindow):
                     write_meta_with_piexif(path, meta_tag_id, new_text)
                 else:
                     raise RuntimeError("未找到 exiftool，无法写入该格式。请配置 exiftools_win/exiftools_mac 或将其加入 PATH。")
+                self._sync_report_metadata_after_save(path, meta_tag_id, new_text)
             elif has_exiftool:
                 if exiftool_key:
                     write_exif_with_exiftool_by_key(path, exiftool_key, new_val)
